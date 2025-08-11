@@ -4,7 +4,7 @@
 ---
 
 ## 🌟 Overview
-CodePulse AI, powered by OpenAI’s GPT-4o, is an advanced tool designed to automate and streamline the creation of testing artifacts from HAR or Postman collection files. By leveraging the intelligent capabilities of GPT-4o, CodePulse AI significantly reduces the effort required to generate comprehensive testing documentation and scripts.
+CodePulse AI, powered by OpenAI’s GPT-4o and Omini-3, is an advanced tool designed to automate and streamline the creation of testing artifacts from HAR or Postman collection files. By leveraging the intelligent capabilities of GPT-4o and Omini-3, CodePulse AI significantly reduces the effort required to generate comprehensive testing documentation and scripts.
 
 With just a few clicks, developers and testers can quickly transform HAR or Postman collection files into structured test plans, test scenarios, detailed test cases, and Playwright automation scripts.
 
@@ -162,5 +162,5 @@ CodePulse-AI/
 ---
 
 ## 💡 Acknowledgements
-Special thanks to OpenAI for providing the GPT-4o model and the Playwright team for their robust testing framework.
+Special thanks to OpenAI for providing the GPT-4o and Omini-3 model and the Playwright team for their robust testing framework.
 

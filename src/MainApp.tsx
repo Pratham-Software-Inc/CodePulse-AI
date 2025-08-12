@@ -1,3 +1,4 @@
+  // Revert retryCount logic
 import React, { useState, useRef, useEffect } from 'react';
 import { Upload, FileUp, CheckCircle, AlertCircle, FileCode, FileText, ListTodo, TestTube, ArrowLeft } from 'lucide-react';
 import { parseHarFile } from './utils/harParser';
@@ -14,6 +15,7 @@ function App() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [showErrorModal, setShowErrorModal] = useState<boolean>(false);
   const [testPlan, setTestPlan] = useState<TestPlan | null>(null);
   const [selectedType, setSelectedType] = useState<GenerationType | null>(null);
   const [apiEndpoints, setApiEndpoints] = useState<{ method: string, url: string, payload?: string }[]>([]);
@@ -146,29 +148,37 @@ function App() {
 
   const handleGenerate = async () => {
     if (!file || !selectedType || !selectedFormat) return;
-  
+
     setStatus('processing');
     setFunnyMessage('Grab a cup of tea or coffee and relax while we prepare your file. This might take a moment! ☕😊');
-  
+
     try {
       const fileContent = await file.text();
       const harEntries = parseHarFile(fileContent);
-  
+
       // 🚀 Pass in the progress callback
       const generatedTestPlan = await generateTestPlan(harEntries, selectedType, (percent) => {
         setProgress(percent);
         setFunnyMessage(getFunnyMessage(percent));
       });
-  
+
+      // If config is missing or response is invalid, show generic config error
+      if (!generatedTestPlan || !generatedTestPlan.stories || !Array.isArray(generatedTestPlan.stories)) {
+        setStatus('error');
+        setErrorMessage('There seems to be an OpenAI configuration or model setup issue. Please check your settings and try again.');
+        setShowErrorModal(true);
+        return;
+      }
+
       setTestPlan(generatedTestPlan);
       setProgress(100);
-  
+
       const content = generateContent(selectedType, generatedTestPlan);
       let extension;
       let filename = `generated-${selectedType}`;
       let fileBlob: Blob;
-  
-      // Always generate Playwright code as .spec.ts for code type
+
+      // ...existing code...
       if (selectedType === 'code') {
         fileBlob = new Blob([content], { type: 'text/typescript' });
         extension = '.spec.ts';
@@ -188,10 +198,10 @@ function App() {
           unit: 'mm',
           format: 'a4',
         });
-      
+
         const lines: string[] = pdf.splitTextToSize(content, 180);
         let y = 10;
-      
+
         lines.forEach((line: string) => {
           if (y > 280) {
             pdf.addPage();
@@ -200,18 +210,18 @@ function App() {
           pdf.text(line, 10, y);
           y += 7;
         });
-      
+
         // 🚨 Important: get the blob using async/await!
         fileBlob = await pdf.output('blob');
         filename += '.pdf';
       } else if (selectedFormat === 'xlsx') {
         const lines = content.split('\n');
-      
+
         // Each line will be one row with one cell
         const worksheet = XLSX.utils.aoa_to_sheet(lines.map(line => [line]));
         const workbook = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(workbook, worksheet, 'TestArtifact');
-      
+
         const xlsxBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
         fileBlob = new Blob([xlsxBuffer], {
           type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -225,14 +235,14 @@ function App() {
             children: [new TextRun(line)],
           })
         );
-      
+
         const doc = new Document({
           sections: [{
             properties: {},
             children: lines,
           }],
         });
-      
+
         const docBuffer = await Packer.toBlob(doc);
         fileBlob = docBuffer;
         extension = '.docx';
@@ -240,7 +250,7 @@ function App() {
       } else {
         throw new Error('Invalid selected format.');
       }
-  
+
       // Create a download link and trigger the download
       //const blob = new Blob([content], { type: 'text/plain' });
       const url = URL.createObjectURL(fileBlob);
@@ -251,14 +261,14 @@ function App() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-  
+
       // Save to history
       setHistory(prevHistory => [...prevHistory, { file, testPlan, selectedType, apiEndpoints, status }]);
       setStatus('success');
     } catch (error) {
-      console.error('Error generating tests:', error);
       setStatus('error');
-      setErrorMessage(error instanceof Error ? error.message : 'Failed to generate tests. Please try again.');
+      setErrorMessage('There seems to be an OpenAI configuration or model setup issue. Please check your settings and try again.');
+      setShowErrorModal(true);
     }
   };
 
@@ -643,7 +653,7 @@ ${tc.expectedResult}
         <div className="mt-2">
           <div
             className={`w-full max-w-2xl mx-auto px-3 py-4 border-2 border-dashed rounded-lg text-center
-              ${status === 'error' ? 'border-red-300 bg-red-50' : isDragging ? 'border-blue-300 bg-blue-50' : 'border-gray-300 bg-white'}`}
+              ${isDragging ? 'border-blue-300 bg-blue-50' : 'border-gray-300 bg-white'}`}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
@@ -795,6 +805,12 @@ ${tc.expectedResult}
                     {generationOptions.find(opt => opt.type === selectedType)?.label} generated successfully!
                   </p>
                   <p className="mt-1 text-xs text-gray-500">Your file has been downloaded.</p>
+                  <div className="mt-2 p-3 bg-yellow-50 border-l-4 border-yellow-400 rounded">
+                    <span className="font-semibold text-yellow-700">Note:</span>
+                    <span className="text-yellow-800 text-sm ml-2">
+                      While generating test artifacts, some endpoints might be skipped if the token size limit is exceeded due to large payloads. To avoid this, we recommend reducing the request body size by filtering out unnecessary fields or data.
+                    </span>
+                  </div>
                 </div>
                 <button
                   onClick={() => {
@@ -834,10 +850,20 @@ ${tc.expectedResult}
               </div>
             )}
 
-            {status === 'error' && errorMessage && (
-              <div>
-                <AlertCircle className="mx-auto h-12 w-12 text-red-500" />
-                <p className="mt-2 text-sm text-red-600">{errorMessage}</p>
+            {/* Error Modal Popup */}
+            {showErrorModal && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center">
+                <div className="fixed inset-0 bg-black bg-opacity-30" onClick={() => setShowErrorModal(false)} />
+                <div className="relative bg-white rounded-lg shadow-2xl w-full max-w-sm p-6 flex flex-col items-center">
+                  <AlertCircle className="mx-auto h-12 w-12 text-red-500" />
+                  <p className="mt-4 text-base text-red-700 font-semibold text-center">{errorMessage}</p>
+                  <button
+                    className="mt-6 px-6 py-2 bg-indigo-600 text-white rounded font-medium hover:bg-indigo-700 focus:outline-none"
+                    onClick={() => setShowErrorModal(false)}
+                  >
+                    OK
+                  </button>
+                </div>
               </div>
             )}
           </div>

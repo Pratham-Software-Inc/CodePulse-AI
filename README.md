@@ -8,6 +8,10 @@ CodePulse AI, powered by OpenAI’s GPT-4o and Omini-3, is an advanced tool desi
 
 With just a few clicks, developers and testers can quickly transform HAR or Postman collection files into structured test plans, test scenarios, detailed test cases, and Playwright automation scripts.
 
+## Privacy Policy
+```bash
+https://pratham-software-inc.github.io/CodePluse-AI/privacy-policy.html
+```
 ---
 
 ## 🚀 Key Features
@@ -77,7 +81,7 @@ Instantly download the generated content, including structured documentation and
 
 ### Step 1: Clone the Repository
 ```bash
-git clone https://git.thepsi.com/Reusable-Components/apiautomationbot-openai.git
+git clone https://github.com/Pratham-Software-Inc/CodePluse-AI.git
 ```
 
 ### Step 2: Install Dependencies

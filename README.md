@@ -10,7 +10,7 @@ With just a few clicks, developers and testers can quickly transform HAR or Post
 
 ## Privacy Policy
 ```bash
-https://pratham-software-inc.github.io/CodePluse-AI/privacy-policy.html
+[Privacy Policy](https://pratham-software-inc.github.io/CodePluse-AI/privacy-policy.html)
 ```
 ---
 

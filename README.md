@@ -43,7 +43,6 @@ With just a few clicks, developers and testers can quickly transform HAR or Post
 
 - File Handling: For uploading and parsing HAR files.
 
-
 ## ⚙️ How It Works
 
 ### Step 1: Upload a HAR File or Postman Collection file

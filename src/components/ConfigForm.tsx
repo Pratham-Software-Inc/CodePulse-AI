@@ -13,7 +13,6 @@ const ConfigForm: React.FC = () => {
     VITE_AZURE_OPENAI_API_BATCH_SIZE: '5'
   });
   const [testing, setTesting] = useState(false);
-  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [submitAction, setSubmitAction] = useState<'save' | 'test' | null>(null);
   const navigate = useNavigate();
 
@@ -28,10 +27,10 @@ const ConfigForm: React.FC = () => {
             VITE_AZURE_OPENAI_MODEL: data.VITE_AZURE_OPENAI_MODEL || 'gpt-4o'
           });
         } else {
-          console.error('Failed to load config');
+          alert('Failed to load config');
         }
       } catch (err) {
-        console.error('Error fetching config:', err);
+        alert('Error fetching config');
       }
     };
 
@@ -65,13 +64,11 @@ const ConfigForm: React.FC = () => {
           alert('❌ Failed to save config');
         }
       } catch (err) {
-        console.error(err);
         alert('Error while submitting config.');
       }
     }
 
     if (submitAction === 'test') {
-      setToast(null);
       setTesting(true);
       try {
         let endpoint = formData.VITE_AZURE_OPENAI_ENDPOINT.replace(/\/$/, '');
@@ -94,7 +91,7 @@ const ConfigForm: React.FC = () => {
         }
 
         setApiResponse(responseData);
-        setToast({ type: 'success', message: 'Connection OK!' });
+        // Removed redundant alert; response is shown in popup
       } catch (err: any) {
         setApiResponse({
           error: {
@@ -104,7 +101,6 @@ const ConfigForm: React.FC = () => {
         });
       } finally {
         setTesting(false);
-        setToast(null);
       }
     }
 

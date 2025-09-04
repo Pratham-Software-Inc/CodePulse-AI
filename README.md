@@ -4,25 +4,42 @@
 ---
 
 ## 🌟 Overview
-CodePulse AI, powered by OpenAI’s GPT-4o and Omini-3, is an advanced tool designed to automate and streamline the creation of testing artifacts from HAR or Postman collection files. By leveraging the intelligent capabilities of GPT-4o and Omini-3, CodePulse AI significantly reduces the effort required to generate comprehensive testing documentation and scripts.
+CodePulse AI, powered by OpenAI’s GPT-4o, is an advanced tool designed to automate and streamline the creation of testing artifacts from HAR or Postman collection files. By leveraging the intelligent capabilities of GPT-4o, CodePulse AI significantly reduces the effort required to generate comprehensive testing documentation and scripts.
 
 With just a few clicks, developers and testers can quickly transform HAR or Postman collection files into structured test plans, test scenarios, detailed test cases, and Playwright automation scripts.
 
-## Privacy Policy
-
-[Privacy Policy](https://pratham-software-inc.github.io/CodePluse-AI/privacy-policy.html)
-
 ---
+
 
 ## 🚀 Key Features
 
-- **Test Plan Generation:** Automatically creates a structured test plan that outlines testing objectives, scope, and strategy.
-- **Test Scenario Generation:** Identifies high-level test scenarios from extracted API endpoints, providing clear guidance on testing coverage.
-- **Test Case Generation:** Generates detailed test cases with step-by-step instructions for efficient validation.
-- **Automation Code Generation:** Creates Playwright test scripts for identified API endpoints, allowing for quick and reliable automated testing.
-- Sample Playwright Framework: Provides a dedicated button to download a sample Playwright framework, making it easy for users to set up their testing environment.
+- **Professional Document Export (Word, PDF, Excel):** Instantly generate professionally formatted documents for all artifact types (Test Plan, Test Scenarios, Test Cases) in DOCX, PDF, and XLSX formats. All exports include complete information, consistent formatting, clear headings, bold labels, bullet points, tables, and section spacing for maximum readability and presentation quality.
+- **Export Parity & Completeness:** Every artifact type can be exported in every format, with all fields (title, description, steps, expected result, API details, severity, priority, etc.) included in each export. Formatting and content are consistent across Word, PDF, and Excel.
+- **Test Plan Generation:** Automatically creates a structured test plan covering objectives, scope, endpoints, stories, test cases, risk assessment, deliverables, criteria, roles, execution strategy, schedule, tools, approvals, references, features, staffing, and more.
+- **Test Scenario & Test Case Generation:** Identifies high-level test scenarios and generates detailed test cases with all relevant fields and step-by-step instructions.
+- **Playwright Automation Code Generation:** Instantly generate Playwright test scripts for all identified API endpoints. Download a ready-to-use Playwright framework with a single click.
+- **Configuration UI:** Easily set and test your OpenAI API key, endpoint, model, and other settings directly from the app’s configuration screen (OpenConfig). Supports both UI-based and .env file configuration.
+- **Built-in Chatbot:** Get instant help, troubleshooting, and testing guidance directly in the app.
+- **Modern UI & Seamless Workflow:** Upload HAR or Postman Collection files, select artifact type and export format, and download results in one streamlined flow.
 
-✨ Each output can be easily downloaded directly to the user's Downloads folder. Additionally, the tool includes a dedicated button to download a sample Playwright framework, simplifying the setup process. For added convenience, a built-in chatbot is available to assist users with testing-related queries and help with any questions regarding CodePulse AI.
+✨ All outputs are ready for professional sharing, audit, and reporting. Export quality and completeness are guaranteed for every artifact and format.
+## 📄 Export Formats & Document Quality
+
+CodePulse AI delivers high-quality, ready-to-share documents for all generated artifacts:
+
+- **Word (DOCX):** Uses the [`docx`](https://www.npmjs.com/package/docx) package for advanced formatting—headings, tables, bold labels, bullet lists, and section spacing. Suitable for direct inclusion in test documentation or sharing with stakeholders.
+- **PDF:** Uses [`jsPDF`](https://www.npmjs.com/package/jspdf) and [`jspdf-autotable`](https://www.npmjs.com/package/jspdf-autotable) for visually consistent, paginated PDF reports with tables, headings, and professional layout.
+- **Excel (XLSX):** Uses [`xlsx-populate`](https://www.npmjs.com/package/xlsx-populate) for structured, multi-sheet Excel files with wrapped content and auto-sized columns for easy analysis and reporting.
+
+**Export Parity:** All artifact types (Test Plan, Test Scenarios, Test Cases) can be exported in all formats, with identical fields and formatting. No information is lost or omitted in any export.
+
+**Formatting Improvements:** Every export features clear section separation, bold labels, bullet points, and tables for structured data. Documents are designed for clarity, completeness, and professional presentation.
+
+**Playwright Automation:** Download Playwright test scripts and a ready-to-use Playwright framework for instant automation.
+
+**Configuration & Support:** Configure OpenAI settings via UI or .env, test your connection, and get instant help from the built-in chatbot.
+
+These packages and features ensure CodePulse AI meets enterprise, audit, and professional documentation requirements.
 
 ---
 ## 🛠️ Prerequisites
@@ -43,6 +60,7 @@ With just a few clicks, developers and testers can quickly transform HAR or Post
 
 - File Handling: For uploading and parsing HAR files.
 
+
 ## ⚙️ How It Works
 
 ### Step 1: Upload a HAR File or Postman Collection file
@@ -54,15 +72,16 @@ Upload a HAR file or Postman Collection file to CodePulse AI. The tool will auto
 
 This intelligent filtering ensures that the OpenAI API generates accurate and efficient outputs.
 
+
 ### Step 2: Generate Testing Artifacts
 Choose from one of the following options:
-- **Generate Test Plan** - Outlines testing objectives and scope
-- **Generate Test Scenarios** - Lists high-level testing scenarios
-- **Generate Test Cases** - Details step-by-step validation instructions
-- **Generate Code** - Produces Playwright test scripts
+- **Generate Test Plan** – Outlines testing objectives and scope
+- **Generate Test Scenarios** – Lists high-level testing scenarios
+- **Generate Test Cases** – Details step-by-step validation instructions
+- **Generate Code** – Produces Playwright test scripts
 
-### Step 3: Download Results
-Instantly download the generated content, including structured documentation and automation scripts.
+### Step 3: Download Results in Your Preferred Format
+Download your generated documentation and scripts as Word, PDF, or Excel files. All documents are formatted for professional use and ready for distribution.
 
 ---
 
@@ -80,7 +99,7 @@ Instantly download the generated content, including structured documentation and
 
 ### Step 1: Clone the Repository
 ```bash
-git clone https://github.com/Pratham-Software-Inc/CodePluse-AI.git
+git clone https://git.thepsi.com/Reusable-Components/apiautomationbot-openai.git
 ```
 
 ### Step 2: Install Dependencies
@@ -165,5 +184,5 @@ CodePulse-AI/
 ---
 
 ## 💡 Acknowledgements
-Special thanks to OpenAI for providing the GPT-4o and Omini-3 model and the Playwright team for their robust testing framework.
+Special thanks to OpenAI for providing the GPT-4o model and the Playwright team for their robust testing framework.
 

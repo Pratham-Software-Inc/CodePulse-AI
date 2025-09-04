@@ -38,20 +38,34 @@ const mergeTestPlans = (testPlans: TestPlan[]): TestPlan => {
 
   const merged: TestPlan = {
     ...testPlans[0],
-    stories: [], riskAssessment: [], deliverables: [], successCriteria: [],
-    rolesAndResponsibility: [], entryCriteria: [], exitCriteria: [],
-    references: [], testItems: [], featuresToBeTested: [],
-    featuresNotToBeTested: [], testDataRequirements: [],
+    stories: [],
+    riskAssessment: [],
+    deliverables: [],
+    successCriteria: [],
+    rolesAndResponsibility: [],
+    entryCriteria: [],
+    exitCriteria: [],
+    references: [],
+    testItems: [],
+    featuresToBeTested: [],
+    featuresNotToBeTested: [],
+    testDataRequirements: [],
     environmentRequirements: testPlans[0].environmentRequirements || {
       hardware: [], software: [], network: ''
     },
-    staffingAndTraining: [], testExecutionStrategy: [],
-    testSchedule: [], toolsAndAutomationStrategy: [],
-    approvalsAndSignoffs: [], passCriteria: [],
-    failCriteria: [], suspensionCriteria: [],
-    negativeScenarios: [], traceabilityMatrix: {}
+    staffingAndTraining: [],
+    testExecutionStrategy: [],
+    testSchedule: [],
+    toolsAndAutomationStrategy: [],
+    approvalsAndSignoffs: [],
+    passCriteria: [],
+    failCriteria: [],
+    suspensionCriteria: [],
+    negativeScenarios: [],
+    traceabilityMatrix: {}
   };
 
+  // Basic push of all arrays
   for (const plan of testPlans) {
     merged.stories.push(...(plan.stories || []));
     merged.riskAssessment.push(...(plan.riskAssessment || []));
@@ -66,7 +80,10 @@ const mergeTestPlans = (testPlans: TestPlan[]): TestPlan => {
     merged.featuresNotToBeTested!.push(...(plan.featuresNotToBeTested || []));
     merged.testDataRequirements!.push(...(plan.testDataRequirements || []));
     if (plan.environmentRequirements) {
-      merged.environmentRequirements = plan.environmentRequirements;
+      // prefer non-empty environment from later plans
+      if (plan.environmentRequirements.hardware.length || plan.environmentRequirements.software.length || plan.environmentRequirements.network) {
+        merged.environmentRequirements = plan.environmentRequirements;
+      }
     }
     merged.staffingAndTraining!.push(...(plan.staffingAndTraining || []));
     merged.testExecutionStrategy!.push(...(plan.testExecutionStrategy || []));
@@ -84,8 +101,318 @@ const mergeTestPlans = (testPlans: TestPlan[]): TestPlan => {
       merged.traceabilityMatrix![reqId] = [...existing, ...matrix[reqId]];
     }
   }
+
+  // (debug counts removed)
+
+  // Helper: unique by key
+  const uniqueBy = <T,>(arr: T[], keyFn: (t: T) => string): T[] => {
+    const map = new Map<string, T>();
+    for (const item of arr || []) {
+      try {
+        const k = keyFn(item);
+        if (!map.has(k)) map.set(k, item);
+      } catch {
+        // fallback stringify
+        const s = JSON.stringify(item);
+        if (!map.has(s)) map.set(s, item);
+      }
+    }
+    return Array.from(map.values());
+  };
+
+  const FUZZY_THRESHOLD = 0.72; // slightly lower to catch more near-duplicates
+
+  const STOPWORDS = new Set(['the','a','an','and','of','to','for','in','on','by','with','is','are','or','as','at','from']);
+  const ALIAS_MAP: Record<string,string> = {
+    '\bauth\b': ' authentication ',
+    '\bauthentication\b': ' authentication ',
+    '\bsvc\b': ' service ',
+    '\bservice\b': ' service ',
+    '\bperf\b': ' performance ',
+    '\bperformance\b': ' performance ',
+    '\bdb\b': ' database ',
+    '\bdatabase\b': ' database ',
+    '\biam\b': ' identity access management ',
+    '\bidentity\b': ' identity ',
+    '\bapi\b': ' api ',
+    // deliverable/report synonyms to help merge 'Bug Report' / 'Defect Log' / 'Defect Report'
+    '\bbug\b': ' defect ',
+    '\bdefect\b': ' defect ',
+    '\bissue\b': ' defect ',
+    '\blog\b': ' report ',
+    '\breport\b': ' report '
+  };
+
+  const normalize = (s?: string | null) => (s || '').toString().trim();
+
+  // Key normalization for grouping: lowercase, collapse whitespace, strip trailing punctuation,
+  // remove stopwords, replace common aliases, and keep only alphanumeric + spaces
+  const normalizeKey = (s?: string | null) => {
+    let str = normalize(s).toLowerCase();
+    if (!str) return '';
+    // replace aliases (apply simple replacements)
+    for (const pat in ALIAS_MAP) {
+      try { str = str.replace(new RegExp(pat, 'gi'), ALIAS_MAP[pat]); } catch (e) { /* ignore bad regex */ }
+    }
+    // remove punctuation, keep spaces and alphanumerics
+    str = str.replace(/[^a-z0-9\s]/g, ' ');
+    // collapse whitespace
+    str = str.replace(/\s+/g, ' ').trim();
+    // remove stopwords
+    const parts = str.split(' ').filter(p => p && !STOPWORDS.has(p));
+    return parts.join(' ').trim();
+  };
+
+  // Simple Levenshtein distance and similarity for fuzzy matching
+  const levenshtein = (a: string, b: string) => {
+    const al = a.length, bl = b.length;
+    if (al === 0) return bl;
+    if (bl === 0) return al;
+    const matrix: number[][] = Array.from({ length: al + 1 }, () => Array(bl + 1).fill(0));
+    for (let i = 0; i <= al; i++) matrix[i][0] = i;
+    for (let j = 0; j <= bl; j++) matrix[0][j] = j;
+    for (let i = 1; i <= al; i++) {
+      for (let j = 1; j <= bl; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+      }
+    }
+    return matrix[al][bl];
+  };
+
+  const similarity = (a: string, b: string) => {
+    if (!a && !b) return 1;
+    if (!a || !b) return 0;
+    const d = levenshtein(a, b);
+    const maxLen = Math.max(a.length, b.length);
+    return maxLen === 0 ? 1 : 1 - d / maxLen;
+  };
+
+  // Find an existing similar key in map (uses FUZZY_THRESHOLD). Return existing key or undefined.
+  const findSimilarKey = (map: Map<string, any>, key: string, threshold = FUZZY_THRESHOLD) => {
+    if (!key || key === '__UNSPECIFIED__') return key;
+    for (const existing of map.keys()) {
+      if (!existing || existing === '__UNSPECIFIED__') continue;
+      const sim = similarity(existing, key);
+      if (sim >= threshold) return existing;
+    }
+    return undefined;
+  };
+
+  const uniqueStrings = (arr?: (string | undefined | null)[]) => Array.from(new Set((arr || []).map(s => normalize(s)).filter(s => s.length > 0))).sort((a, b) => a.localeCompare(b));
+
+  // Deduplicate stories by id or title, and dedupe test cases inside each story
+  merged.stories = uniqueBy(merged.stories || [], (s: any) => normalizeKey((s.id || s.title || JSON.stringify(s)).toString()));
+  merged.stories = merged.stories.map(story => {
+    const tc = story.testCases || [];
+    const uniqueTcs = uniqueBy(tc, (t: any) => normalizeKey((t.id || t.title || JSON.stringify(t)).toString()));
+    // sort test cases by id or title for deterministic order
+    uniqueTcs.sort((a: any, b: any) => (normalize((a.id || a.title || '')).localeCompare(normalize((b.id || b.title || '')))));
+    return { ...story, testCases: uniqueTcs } as typeof story;
+  });
+
+  // Deduplicate object arrays by meaningful keys
+  merged.riskAssessment = uniqueBy(merged.riskAssessment || [], (r: any) => `${normalizeKey(r.category)}|${normalizeKey(r.description)}|${normalizeKey(r.mitigation)}`);
+  merged.deliverables = uniqueBy(merged.deliverables || [], (d: any) => `${normalizeKey(d.title)}|${normalizeKey(d.description)}|${normalizeKey(d.format)}`);
+  merged.successCriteria = uniqueBy(merged.successCriteria || [], (s: any) => `${normalizeKey(s.category)}|${normalizeKey(s.criteria)}|${normalizeKey(s.threshold)}`);
+  merged.rolesAndResponsibility = uniqueBy(merged.rolesAndResponsibility || [], (r: any) => `${normalizeKey(r.role)}|${normalizeKey(r.responsibility)}`);
+
+  // Consolidation helpers: join lines and group objects by primary keys, merging fields into sets
+  const joinLines = (items: Set<string>) => Array.from(items).filter(Boolean).map(s => `- ${s}`).join('\n');
+  
+  const groupByPrimaryAndMerge = (arr: any[] = [], primaryKeys: string[] = ['description'], mergeFields: string[] = ['description']) => {
+    const map = new Map<string, any>();
+    for (const item of arr || []) {
+      // build key from first available primary key fields
+      const rawKeyParts = primaryKeys.map(k => normalizeKey(item?.[k])).filter(s => s.length > 0);
+      const rawKey = rawKeyParts.join('|') || '__UNSPECIFIED__';
+      // try to find an existing similar key to merge into
+      const similar = findSimilarKey(map, rawKey);
+      const key = similar ?? rawKey;
+
+      if (!map.has(key)) {
+        // initialize accumulator: store the first non-empty primary value for later output
+        const primaryOut: any = {};
+        for (const pk of primaryKeys) {
+          const v = normalize(item?.[pk]);
+          if (v) {
+            primaryOut[pk] = v;
+            break;
+          }
+        }
+        const accum: any = { ...primaryOut };
+        // prepare merge field sets
+        for (const mf of mergeFields) accum[mf] = new Set<string>();
+        map.set(key, accum);
+      }
+
+      const accum = map.get(key);
+      for (const mf of mergeFields) {
+        const val = item?.[mf];
+        if (Array.isArray(val)) {
+          for (const v of val) if (v) accum[mf].add(normalize(v));
+        } else if (val) {
+          accum[mf].add(normalize(val));
+        }
+      }
+    }
+
+    // produce merged objects
+    return Array.from(map.values()).map((v: any) => {
+      const out: any = {};
+      // pick a primary field value to output (first available)
+      for (const pk of primaryKeys) {
+        if (v[pk]) { out[pk] = v[pk]; break; }
+      }
+      for (const mf of mergeFields) out[mf] = joinLines(v[mf]);
+      return out;
+    });
+  };
+
+  // Apply grouping & merging for simple description-based sections so duplicate rows are consolidated
+  merged.entryCriteria = groupByPrimaryAndMerge(merged.entryCriteria || [], ['description'], ['description']);
+  merged.exitCriteria = groupByPrimaryAndMerge(merged.exitCriteria || [], ['description'], ['description']);
+  merged.testExecutionStrategy = groupByPrimaryAndMerge(merged.testExecutionStrategy || [], ['description'], ['description']);
+  merged.testSchedule = groupByPrimaryAndMerge(merged.testSchedule || [], ['description'], ['description']);
+  merged.toolsAndAutomationStrategy = groupByPrimaryAndMerge(merged.toolsAndAutomationStrategy || [], ['description'], ['description']);
+
+  // Approvals & Signoffs: try to group by approver/title/description and merge descriptions
+  merged.approvalsAndSignoffs = groupByPrimaryAndMerge(merged.approvalsAndSignoffs || [], ['approver', 'title', 'description'], ['description']);
+
+  // References and testItems
+  merged.references = uniqueBy(merged.references || [], (r: any) => `${normalizeKey(r.title)}|${normalizeKey(r.url)}`);
+  merged.testItems = uniqueBy(merged.testItems || [], (t: any) => `${normalizeKey((t as any).id)}|${normalizeKey((t as any).endpoint)}|${normalizeKey((t as any).method)}`);
+
+  // Features and simple string lists
+  merged.featuresToBeTested = uniqueStrings(merged.featuresToBeTested);
+  merged.featuresNotToBeTested = uniqueStrings(merged.featuresNotToBeTested);
+  merged.passCriteria = uniqueStrings(merged.passCriteria);
+  merged.failCriteria = uniqueStrings(merged.failCriteria);
+  merged.suspensionCriteria = uniqueStrings(merged.suspensionCriteria);
+  merged.testDataRequirements = uniqueStrings(merged.testDataRequirements);
+  merged.negativeScenarios = uniqueStrings(merged.negativeScenarios);
+
+  // Staffing: merge skills by role
+  const staffingMap = new Map<string, Set<string>>();
+  for (const s of merged.staffingAndTraining || []) {
+    const role = normalize((s as any).role || '');
+    if (!role) continue;
+    const roleKey = normalizeKey(role);
+    if (!staffingMap.has(roleKey)) staffingMap.set(roleKey, new Set<string>());
+    for (const sk of (s as any).skills || []) {
+      const skill = normalize(sk);
+      if (skill) staffingMap.get(roleKey)!.add(skill);
+    }
+  }
+  merged.staffingAndTraining = Array.from(staffingMap.entries()).map(([roleKey, skillsSet]) => ({ role: roleKey, skills: Array.from(skillsSet).sort((a,b)=>a.localeCompare(b)) }));
+
+  // Additional: ensure deliverables and successCriteria are fully merged (title/category grouping already applied above via uniqueBy) but also concatenate descriptions/formats/frequencies where duplicates exist
+  // (Note: uniqueBy on deliverables/successCriteria retains one representative; we re-run grouping to ensure multi-row consolidation of their descriptive fields)
+  const deliverableGroup = new Map<string, { title: string; descriptions: Set<string>; formats: Set<string>; frequencies: Set<string> }>();
+  for (const d of merged.deliverables || []) {
+    // build raw key from title or first part of description to be more tolerant
+    const rawTitle = normalizeKey((d as any).title);
+    const rawDescSnippet = normalizeKey((d as any).description).split(' ').slice(0,6).join(' ');
+    const rawKey = rawTitle || rawDescSnippet || '__UNSPECIFIED__';
+    const similar = findSimilarKey(deliverableGroup, rawKey);
+    const key = similar ?? rawKey;
+    if (!deliverableGroup.has(key)) deliverableGroup.set(key, { title: key === '__UNSPECIFIED__' ? '' : (d as any).title || '', descriptions: new Set(), formats: new Set(), frequencies: new Set() });
+    if ((d as any).description) deliverableGroup.get(key)!.descriptions.add(normalize((d as any).description));
+    if ((d as any).format) deliverableGroup.get(key)!.formats.add(normalize((d as any).format));
+    if ((d as any).frequency) deliverableGroup.get(key)!.frequencies.add(normalize((d as any).frequency));
+  }
+  merged.deliverables = Array.from(deliverableGroup.values()).map(v => ({ title: v.title, description: joinLines(v.descriptions), format: Array.from(v.formats).filter(Boolean).sort().join(', '), frequency: Array.from(v.frequencies).filter(Boolean).sort().join(', ') }));
+
+  const successGroup = new Map<string, { category: string; criteria: Set<string>; thresholds: Set<string> }>();
+  for (const s of merged.successCriteria || []) {
+    const rawCategory = normalizeKey((s as any).category);
+    const rawCriteriaSnippet = normalizeKey((s as any).criteria).split(' ').slice(0,6).join(' ');
+    const rawKey = rawCategory || rawCriteriaSnippet || '__UNSPECIFIED__';
+    const similar = findSimilarKey(successGroup, rawKey);
+    const key = similar ?? rawKey;
+    if (!successGroup.has(key)) successGroup.set(key, { category: key === '__UNSPECIFIED__' ? '' : (s as any).category || '', criteria: new Set(), thresholds: new Set() });
+    if ((s as any).criteria) successGroup.get(key)!.criteria.add(normalize((s as any).criteria));
+    if ((s as any).threshold) successGroup.get(key)!.thresholds.add(normalize((s as any).threshold));
+  }
+  merged.successCriteria = Array.from(successGroup.values()).map(v => ({ category: v.category, criteria: joinLines(v.criteria), threshold: Array.from(v.thresholds).filter(Boolean).sort().join(', ') }));
+
+  // === Further consolidation: Group roles, risk assessment and ensure sorting across sections ===
+
+  // Roles & Responsibilities: group by role and concatenate responsibilities
+  const rolesGroup = new Map<string, { role: string; responsibilities: Set<string> }>();
+  for (const r of merged.rolesAndResponsibility || []) {
+    const rawRole = normalizeKey((r as any).role);
+    const rawRespSnippet = normalizeKey((r as any).responsibility).split(' ').slice(0,4).join(' ');
+    const rawKey = rawRole || rawRespSnippet || '__UNSPECIFIED__';
+    const similar = findSimilarKey(rolesGroup, rawKey);
+    const key = similar ?? rawKey;
+    if (!rolesGroup.has(key)) rolesGroup.set(key, { role: key === '__UNSPECIFIED__' ? '' : (r as any).role || '', responsibilities: new Set<string>() });
+    if ((r as any).responsibility) rolesGroup.get(key)!.responsibilities.add(normalize((r as any).responsibility));
+  }
+  merged.rolesAndResponsibility = Array.from(rolesGroup.values()).map(v => ({ role: v.role, responsibility: joinLines(v.responsibilities) }));
+
+  // Risk Assessment: group by category and merge descriptions/mitigations/impacts with impact priority
+  const riskMap = new Map<string, { category: string; descriptions: Set<string>; mitigations: Set<string>; impacts: Set<string> }>();
+  for (const r of merged.riskAssessment || []) {
+    const rawKey = normalizeKey((r as any).category) || normalizeKey((r as any).description) || '__UNSPECIFIED__';
+    const similar = findSimilarKey(riskMap, rawKey);
+    const key = similar ?? rawKey;
+    if (!riskMap.has(key)) riskMap.set(key, { category: key === '__UNSPECIFIED__' ? '' : (r as any).category || '', descriptions: new Set(), mitigations: new Set(), impacts: new Set() });
+    if ((r as any).description) riskMap.get(key)!.descriptions.add(normalize((r as any).description));
+    if ((r as any).mitigation) riskMap.get(key)!.mitigations.add(normalize((r as any).mitigation));
+    if ((r as any).impact) riskMap.get(key)!.impacts.add(normalize((r as any).impact));
+  }
+  merged.riskAssessment = Array.from(riskMap.values()).map(v => {
+    const impacts = Array.from(v.impacts).map(s => s as 'Low' | 'Medium' | 'High').filter(Boolean);
+    let aggregatedImpact: 'Low' | 'Medium' | 'High' = 'Low';
+    if (impacts.includes('High')) aggregatedImpact = 'High';
+    else if (impacts.includes('Medium')) aggregatedImpact = 'Medium';
+    else if (impacts.includes('Low')) aggregatedImpact = 'Low';
+    return { category: v.category, description: joinLines(v.descriptions), mitigation: joinLines(v.mitigations), impact: aggregatedImpact };
+  });
+
+  // Sorting helpers: sort object arrays by a provided keyFn, and sort string arrays
+  const sortObjects = <T>(arr: T[] = [], keyFn: (t: T) => string) => arr.sort((a, b) => keyFn(a).localeCompare(keyFn(b)));
+  const sortStrings = (arr: string[] = []) => arr.sort((a, b) => a.localeCompare(b));
+
+  // Apply sorting
+  merged.riskAssessment = sortObjects(merged.riskAssessment || [], (x: any) => normalizeKey(x.category));
+  merged.deliverables = sortObjects(merged.deliverables || [], (x: any) => normalizeKey(x.title));
+  merged.successCriteria = sortObjects(merged.successCriteria || [], (x: any) => normalizeKey(x.category));
+  merged.rolesAndResponsibility = sortObjects(merged.rolesAndResponsibility || [], (x: any) => normalizeKey(x.role));
+  merged.entryCriteria = sortObjects(merged.entryCriteria || [], (x: any) => normalizeKey(x.description));
+  merged.exitCriteria = sortObjects(merged.exitCriteria || [], (x: any) => normalizeKey(x.description));
+  merged.testExecutionStrategy = sortObjects(merged.testExecutionStrategy || [], (x: any) => normalizeKey(x.description));
+  merged.testSchedule = sortObjects(merged.testSchedule || [], (x: any) => normalizeKey(x.description));
+  merged.toolsAndAutomationStrategy = sortObjects(merged.toolsAndAutomationStrategy || [], (x: any) => normalizeKey(x.description));
+  merged.approvalsAndSignoffs = sortObjects(merged.approvalsAndSignoffs || [], (x: any) => normalizeKey(x.description));
+  merged.references = sortObjects(merged.references || [], (x: any) => normalizeKey(x.title));
+  merged.testItems = sortObjects(merged.testItems || [], (x: any) => (normalizeKey((x as any).id) || normalizeKey((x as any).endpoint)));
+
+  merged.featuresToBeTested = sortStrings(merged.featuresToBeTested || []);
+  merged.featuresNotToBeTested = sortStrings(merged.featuresNotToBeTested || []);
+  merged.passCriteria = sortStrings(merged.passCriteria || []);
+  merged.failCriteria = sortStrings(merged.failCriteria || []);
+  merged.suspensionCriteria = sortStrings(merged.suspensionCriteria || []);
+  merged.testDataRequirements = sortStrings(merged.testDataRequirements || []);
+  merged.negativeScenarios = sortStrings(merged.negativeScenarios || []);
+
+  // Staffing: ensure sorted by role
+  merged.staffingAndTraining = sortObjects(merged.staffingAndTraining || [], (x: any) => normalizeKey(x.role));
+
+  // Traceability matrix: unique test case ids per requirement and ensure deterministic ordering of keys and values
+  const sortedTrace: Record<string, string[]> = {};
+  const reqIds = Object.keys(merged.traceabilityMatrix || {}).sort((a,b) => a.localeCompare(b));
+  for (const reqId of reqIds) {
+    const vals = Array.from(new Set((merged.traceabilityMatrix![reqId] || []).map(s => normalize(s)))).filter(s => s.length > 0).sort((a,b)=>a.localeCompare(b));
+    sortedTrace[reqId] = vals;
+  }
+  merged.traceabilityMatrix = sortedTrace;
+
   return merged;
-};
+}
+
+export default mergeTestPlans;
 
 const TEST_PLAN_SKELETON = `You MUST respond only with a JSON object matching this exact structure (no markdown or commentary):
 {
@@ -493,6 +820,10 @@ export async function generateTestPlan(
   type: GenerationType = 'testPlan',
   onProgress?: (percent: number) => void
 ): Promise<TestPlan> {
+  if (!harEntries || harEntries.length === 0) {
+    throw new Error('no valid endpoints');
+  }
+
   const config = await fetchConfig();
 
   if (!openai) {
@@ -523,14 +854,10 @@ export async function generateTestPlan(
 
   for (let i = 0; i < totalBatches; i++) {
     const batch = batches[i];
-
-    // Ensure endpoint exists
     batch.forEach(entry => {
       entry.request.endpoint = entry.request.url;
     });
-
     const prompt = generatePrompt(type, batch);
-
     let completionParams: any = {
       messages: [
         {
@@ -541,7 +868,6 @@ export async function generateTestPlan(
       ],
       response_format: { type: 'json_object' }
     };
-
     if (model === 'gpt-4o') {
       completionParams = {
         ...completionParams,
@@ -557,29 +883,57 @@ export async function generateTestPlan(
         reasoning_effort: 'low'
       };
     }
-
     try {
       const completion = await openai.chat.completions.create(completionParams);
       const response = completion.choices[0].message.content;
-
       if (!response) {
-        console.warn(`⚠️ Empty response from OpenAI for batch ${i + 1}`);
-        continue;
+        throw new Error('no valid endpoints');
       }
-
       try {
-        const testPlan = JSON.parse(response) as TestPlan;
-        testPlans.push(testPlan);
+        const parsed = JSON.parse(response);
+        let planFromBatch: TestPlan;
+        if (type === 'testPlan') {
+          planFromBatch = parsed as TestPlan;
+        } else {
+          const stories = parsed?.stories || (Array.isArray(parsed) ? (parsed[0]?.stories || parsed) : []);
+          planFromBatch = {
+            ...(testPlans[0] || {}),
+            title: '',
+            description: '',
+            stories: Array.isArray(stories) ? stories : [],
+            riskAssessment: [],
+            deliverables: [],
+            successCriteria: [],
+            rolesAndResponsibility: [],
+            entryCriteria: [],
+            exitCriteria: [],
+            references: [],
+            testItems: [],
+            featuresToBeTested: [],
+            featuresNotToBeTested: [],
+            testDataRequirements: [],
+            environmentRequirements: testPlans[0]?.environmentRequirements || { hardware: [], software: [], network: '' },
+            staffingAndTraining: [],
+            testExecutionStrategy: [],
+            testSchedule: [],
+            toolsAndAutomationStrategy: [],
+            approvalsAndSignoffs: [],
+            passCriteria: [],
+            failCriteria: [],
+            suspensionCriteria: [],
+            negativeScenarios: [],
+            traceabilityMatrix: {}
+          } as TestPlan;
+        }
+        testPlans.push(planFromBatch);
       } catch (err) {
         console.warn(`⚠️ Failed to parse JSON for batch ${i + 1}:`, response);
         continue;
       }
-
     } catch (error) {
       console.warn(`🚨 OpenAI API error on batch ${i + 1}:`, error);
       continue;
     }
-
     if (onProgress) {
       const percent = Math.floor(((i + 1) / totalBatches) * 100);
       onProgress(percent);
@@ -589,5 +943,15 @@ export async function generateTestPlan(
   // Finalize progress after loop
   if (onProgress) onProgress(100);
 
-  return mergeTestPlans(testPlans);
+  if (!testPlans.length) {
+    throw new Error('no valid endpoints');
+  }
+  const merged = mergeTestPlans(testPlans);
+  // If merged stories is missing or empty, treat as no valid endpoints
+  if (!merged.stories || !Array.isArray(merged.stories) || merged.stories.length === 0) {
+    throw new Error('no valid endpoints');
+  }
+  return merged;
 }
+
+// Debug note removed to avoid console usage in production code.

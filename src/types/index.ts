@@ -105,6 +105,8 @@ export interface TestCase {
   severity?: 'High' | 'Medium' | 'Low';
   priority?: number;
   reqId?: string;
+  validationCriteria?: string[];
+  prerequisites?: string[];
 }
 
 export interface RiskAssessment {

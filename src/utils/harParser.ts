@@ -2,7 +2,7 @@ import type { HarEntry } from '../types';
 
 // Postman Collection to HAR entry converter (supports v1 and v2.x)
 export function convertPostmanToHar(postmanJson: any): HarEntry[] {
-  console.log('Converting Postman JSON to HAR');
+  // Converted Postman to HAR (logging removed)
 
   const isV2 = postmanJson.info?.schema?.includes('v2');
   const isV1 = postmanJson.info?.schema?.includes('v1') || postmanJson.info?.postman_id;
@@ -284,7 +284,7 @@ function removeDuplicateRequests(entries: HarEntry[]): HarEntry[] {
           uniqueRequests.set(key, entry);
         }
       } else {
-        console.warn(`❗ Skipped unrecognized URL: ${rawUrl}`);
+        // Skipped unrecognized URL (no logging)
       }
     }
   });
@@ -294,33 +294,36 @@ function removeDuplicateRequests(entries: HarEntry[]): HarEntry[] {
 
 
 export function parseHarFile(harContent: string): HarEntry[] {
-  console.log('Parsing input content...');
+  // Parsing input (logging removed)
 
   try {
     const json = JSON.parse(harContent);
 
     const isPostman = json.info?.schema?.includes('postman') || json.info?.postman_id;
     if (isPostman) {
-      console.log('Detected Postman collection, converting...');
+      // Detected Postman collection (no logging)
       const entries = convertPostmanToHar(json);
-      console.log('Converted entries:', entries);
-      return removeDuplicateRequests(entries.filter(entry => {
+      const validEntries = removeDuplicateRequests(entries.filter(entry => {
         const url = entry.request.url || '';
         return isValidUrl(url) && !isExcludedRequest(url, entry.request.method);
       }));
+      if (!validEntries.length) {
+        throw new Error('no valid endpoints');
+      }
+      return validEntries;
     }
 
     if (!json.log || !Array.isArray(json.log.entries)) {
       throw new Error('Invalid HAR format: Missing log.entries array');
     }
 
-    console.log('Detected HAR format, filtering entries...');
+    // Detected HAR format (no logging)
 
     const filteredEntries = json.log.entries
       .filter((entry: any) => {
         const url = entry.request?.url || '';
         if (!entry || !entry.request || typeof entry.request !== 'object' || !entry.request.method || !entry.request.url || !entry.response) {
-          console.warn('Skipping invalid entry:', entry);
+          // Skipping invalid entry (no logging)
           return false;
         }
         return isValidUrl(url) && !isExcludedRequest(url, entry.request.method);
@@ -359,9 +362,16 @@ export function parseHarFile(harContent: string): HarEntry[] {
         };
       });
 
-    return removeDuplicateRequests(filteredEntries);
+    const validEntries = removeDuplicateRequests(filteredEntries);
+    if (!validEntries.length) {
+      throw new Error('no valid endpoints');
+    }
+    return validEntries;
   } catch (err) {
-    console.error('Failed to parse HAR/Postman content:', err);
+    // If the error is 'no valid endpoints', propagate it for UI handling
+    if (err instanceof Error && err.message === 'no valid endpoints') {
+      throw err;
+    }
     throw new Error('Invalid file format: Not a valid HAR or Postman JSON');
   }
 }

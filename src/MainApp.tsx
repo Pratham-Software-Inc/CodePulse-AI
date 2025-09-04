@@ -1,18 +1,34 @@
-  // Revert retryCount logic
+// Required imports
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FileUp, CheckCircle, AlertCircle, FileCode, FileText, ListTodo, TestTube, ArrowLeft } from 'lucide-react';
-import { parseHarFile } from './utils/harParser';
-import { generateTestPlan } from './services/openaiService';
-import type { TestPlan, GenerationType } from './types';
-import * as XLSX from 'xlsx';
-import {Document, Packer, Paragraph, TextRun,} from 'docx';
-import jsPDF from 'jspdf';
 import ReactMarkdown from 'react-markdown';
-import { fetchConfig } from '../src/services/configService';
-import { useNavigate, useNavigationType, useLocation } from 'react-router-dom';
+import { useNavigate, useNavigationType } from 'react-router-dom';
+import { jsPDF } from 'jspdf';
+import autoTable, { type RowInput, type UserOptions } from 'jspdf-autotable';
+import {
+  Document,
+  Packer,
+  Paragraph,
+  TextRun,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  HeadingLevel,
+  TableLayoutType,
+} from 'docx';
+// Use browser build for xlsx-populate (dynamic import in buildXlsxBlob)
+import { FileText, ListTodo, TestTube, FileCode, Upload, ArrowLeft, FileUp, CheckCircle, AlertCircle } from 'lucide-react';
+import { parseHarFile } from './utils/harParser';
+import { TestPlan, GenerationType } from './types';
+import { generateTestPlan } from './services/openaiService';
+
+// Helper for column letter (A, B, ..., Z, AA, AB, ...)
+const colLetter = (n: number) => { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - m) / 26); } return s; };
 
 function App() {
   const [file, setFile] = useState<File | null>(null);
+  const [showApiDrawer, setShowApiDrawer] = useState(false);
+  // Remove any API Endpoints error modal state (if present)
   const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [showErrorModal, setShowErrorModal] = useState<boolean>(false);
@@ -29,7 +45,7 @@ function App() {
   const navigate = useNavigate();
   const navigationType = useNavigationType();
   // Removed unused location
-  const [showApiDrawer, setShowApiDrawer] = useState(false);
+
 
 
   useEffect(() => {
@@ -39,7 +55,7 @@ function App() {
       setTimeout(() => {
         localStorage.setItem('splashSeen', 'true');
         setShowSplash(false);
-      }, 10000); // splash visible for 3 seconds
+      }, 10000); // splash visible for 10 seconds
     }
   }, []);
 
@@ -58,6 +74,10 @@ function App() {
       setTestPlan(null);
       setSelectedType(null);
       setApiEndpoints([]);
+// Clear the native file input value so selecting the same file later triggers a change event
+      if (fileInputRef.current) {
+        try { fileInputRef.current.value = ''; } catch (e) { /* ignore */ }
+      }
     } else {
       setErrorMessage('Please select a valid .har file or Postman Collection file.');
       setStatus('error');
@@ -68,12 +88,16 @@ function App() {
     if (history.length > 0) {
       // Restore the last state from history
       const previousState = history[history.length - 1]; // Get the last state
-      setFile(previousState.file);
-      setTestPlan(previousState.testPlan);
-      setSelectedType(previousState.selectedType);
-      setApiEndpoints(previousState.apiEndpoints);
-      setStatus(previousState.status);
+      setFile(previousState?.file ?? null);
+      setTestPlan(null);
+      setSelectedType(null);
+      setApiEndpoints(previousState?.apiEndpoints ?? []);
+      setStatus('idle');
       setSelectedFormat(''); // Clear format selection to force user to pick again
+// Clear native file input so re-selecting the same file will work
+      if (fileInputRef.current) {
+        try { fileInputRef.current.value = ''; } catch (e) { /* ignore */ }
+      }
       // Update history by removing the last state
       setHistory(prevHistory => prevHistory.slice(0, -1));
     } else if (window.history.length > 1 && navigationType !== 'POP') {
@@ -104,6 +128,10 @@ function App() {
       setTestPlan(null);
       setSelectedType(null);
       setApiEndpoints([]);
+    // Clear the native file input so a subsequent browse+select of the same file will fire change
+      if (fileInputRef.current) {
+        try { fileInputRef.current.value = ''; } catch (e) { /* ignore */ }
+      }
     } else {
       setErrorMessage('Please drop a valid .har or Postman .json file');
       setStatus('error');
@@ -143,131 +171,1481 @@ function App() {
   if (percent < 95) return '📦 Packaging up your test artifacts';
   if (percent < 100) return '🎯 Final review underway… almost there!';
   return '🎉 Mission accomplished. Your artifacts are ready!';
+}
+
+// ========== FORMATTED EXPORT BUILDERS (DOCX / PDF / XLSX) ==========
+
+// Types helper (already have TestPlan & GenerationType in file)
+type ArtifactKind = GenerationType;
+
+// Safe array
+const arr = <T,>(x: T[] | undefined | null): T[] => (Array.isArray(x) ? x : []);
+
+// Canonical, sorted uniqueEndpoints
+function uniqueEndpoints(plan: TestPlan): string[] {
+  const set = new Set<string>();
+  (plan.stories ?? []).forEach(s =>
+    (s.testCases ?? []).forEach(tc => {
+      const ep = tc.apiDetails?.endpoint?.trim();
+      if (ep) set.add(ep);
+    })
+  );
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
+// DOCX helpers
+const H = (text: string, level: keyof typeof HeadingLevel) =>
+  new Paragraph({ text, heading: HeadingLevel[level], spacing: { after: 200 } });
+const B = (text: string) => new TextRun({ text, bold: true });
+
+// Remove unused truncation constant: we now preserve full content and insert breaks instead of truncating
+// Add global export safety limits (used by PDF/DOCX/XLSX generators)
+const EXPORT_MAX_ROWS_PER_TABLE = Number.MAX_SAFE_INTEGER; // was 40
+// Avoid splitting Excel sheets into multiple parts for scenarios/test cases
+const XLSX_MAX_ROWS_PER_SHEET = 50000; // split sheets at 50k rows for Excel safety
+
+// Add helper to insert line breaks into very long continuous tokens so word-wrapping works in DOCX/Excel/PDF exports
+function breakLongSegments(text: string, maxLen: number = 100): string {
+  if (text === null || text === undefined) return '';
+  const s = String(text);
+  // Preserve existing whitespace while breaking up any long continuous non-whitespace tokens
+  return s.split(/(\s+)/).map(token => {
+    // If token is purely whitespace, keep it as-is
+    if (/^\s+$/.test(token)) return token;
+    if (token.length <= maxLen) return token;
+    const parts: string[] = [];
+    for (let i = 0; i < token.length; i += maxLen) {
+      parts.push(token.slice(i, i + maxLen));
+    }
+    // Insert a newline between parts to allow breaking inside table cells (works for Excel, PDF and Word)
+    return parts.join('\n');
+  }).join('');
+}
+
+// Replace truncating safeCellValue with a non-destructive version that preserves full content but inserts breaks
+const safeCellValue = (v: any) => {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') {
+    return breakLongSegments(v, 100);
+  }
+  try {
+    const s = JSON.stringify(v, null, 2);
+    return breakLongSegments(s, 100);
+  } catch (e) {
+    const s = String(v);
+    return breakLongSegments(s, 100);
+  }
 };
 
+// Unified spacer helper used by DOCX/PDF/XLSX table renderers
+function addTableSpacer(format: 'docx' | 'pdf' | 'xlsx', context?: any) {
+  try {
+    if (format === 'docx') {
+      // Return a blank paragraph with spacing after so callers can push it into children
+      return new Paragraph({ spacing: { after: 200 } });
+    }
+    if (format === 'pdf') {
+      const pdf: any = context?.pdf;
+      // Prefer last autoTable finalY if available
+      const lastY = pdf && pdf.lastAutoTable && typeof pdf.lastAutoTable.finalY === 'number'
+        ? pdf.lastAutoTable.finalY
+        : (context?.currentY ?? 0);
+      // return mm position (finalY + 10mm)
+      return lastY + 10;
+    }
+    if (format === 'xlsx') {
+      const sheet = context?.sheet;
+      const lastRow = typeof context?.lastRow === 'number' ? context.lastRow : null;
+      if (sheet && lastRow !== null) {
+        try { sheet.row(lastRow + 1).height(15); } catch (e) { /* ignore */ }
+      }
+      return;
+    }
+  } catch (e) {
+    // best-effort; ignore failures so exports still succeed
+  }
+}
+
+// Update tableDocx to apply computed column widths and cell margins so Word wraps inside cells
+const tableDocx = (headers: string[], rows: (string | number | undefined)[][]): (Table | Paragraph)[] => {
+  const normRows = rows.map(r => r.map(c => c === null || c === undefined ? '' : breakLongSegments(String(c), 100)));
+  const tables: (Table | Paragraph)[] = [];
+
+  // Use DXA twips and cap per-cell width to approx 2880 (≈200px)
+  const pageWidthTwips = 12240;
+  const marginTwips = 1440;
+  const availableWidth = pageWidthTwips - marginTwips * 2;
+  const MAX_CELL = 2880;
+  const MIN_CELL = 800;
+
+  let colWidths: number[] = headers.map(h => {
+    const key = String(h || '').toLowerCase();
+    if (key.includes('url') || key.includes('endpoint') || key.includes('payload') || key.includes('body') || key.includes('headers') || key.includes('description')) return MAX_CELL;
+    return MIN_CELL;
+  });
+
+  // Shrink columns proportionally if total width exceeds available page width
+  const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+  if (totalWidth > availableWidth) {
+    const shrinkFactor = availableWidth / totalWidth;
+    colWidths = colWidths.map(w => Math.max(MIN_CELL, Math.floor(w * shrinkFactor)));
+  }
+
+  // Final clamp: ensure sum of colWidths <= availableWidth
+  const sumWidths = colWidths.reduce((a, b) => a + b, 0);
+  if (sumWidths > availableWidth) {
+    const scale = availableWidth / sumWidths;
+    colWidths = colWidths.map(w => Math.max(MIN_CELL, Math.floor(w * scale)));
+  }
+
+  for (let i = 0; i < normRows.length; i += EXPORT_MAX_ROWS_PER_TABLE) {
+    const chunk = normRows.slice(i, i + EXPORT_MAX_ROWS_PER_TABLE);
+    const table = new Table({
+      width: { size: availableWidth, type: WidthType.DXA },
+      layout: TableLayoutType.FIXED,
+      rows: [
+        new TableRow({ children: headers.map((h, idx) => new TableCell({ width: { size: colWidths[idx] || Math.floor(availableWidth / headers.length), type: WidthType.DXA }, margins: { top: 100, bottom: 100, left: 100, right: 100 }, children: [new Paragraph({ children: [B(h)] })] })) }),
+        ...chunk.map(r => new TableRow({ children: r.map((c, idx) => new TableCell({ width: { size: colWidths[idx] || Math.floor(availableWidth / headers.length), type: WidthType.DXA }, verticalAlign: 'top', margins: { top: 100, bottom: 100, left: 100, right: 100 }, children: [new Paragraph(String(c ?? ''))] })) }))
+      ]
+    });
+    tables.push(table);
+    // add a blank paragraph spacer after each table
+    tables.push(addTableSpacer('docx'));
+  }
+
+  if (tables.length === 0) {
+    const table = new Table({
+      width: { size: availableWidth, type: WidthType.DXA },
+      layout: TableLayoutType.FIXED,
+      rows: [ new TableRow({ children: headers.map((h, idx) => new TableCell({ width: { size: colWidths[idx] || Math.floor(availableWidth / headers.length), type: WidthType.DXA }, margins: { top: 100, bottom: 100, left: 100, right: 100 }, children: [new Paragraph({ children: [B(h)] })] })) }) ]
+    });
+    tables.push(table);
+    tables.push(addTableSpacer('docx'));
+  }
+
+  return tables;
+};
+
+async function buildDocxBlob(kind: ArtifactKind, plan: TestPlan): Promise<Blob> {
+  const children: any[] = [];
+  let prefix = '';
+  if (kind === 'testPlan') prefix = 'Test Plan';
+  else if (kind === 'testScenario') prefix = 'Test Scenarios';
+  else if (kind === 'testCases') prefix = 'Test Cases';
+  const docTitle = plan.title && plan.title.trim() ? `${prefix}: ${plan.title}` : '';
+  if (docTitle) children.push(H(docTitle, 'HEADING_1'));
+  if (kind === 'testPlan') {
+    // 1. Overview
+    children.push(H('Overview', 'HEADING_2'));
+    children.push(new Paragraph(plan.description || ''));
+    children.push(new Paragraph(''));
+
+    // 2. Test Objectives and Scope
+    children.push(H('Test Objectives and Scope', 'HEADING_2'));
+    if (arr(plan.stories).length) {
+      plan.stories.forEach(story => {
+        children.push(new Paragraph(`• ${story.title}`));
+      });
+    } else {
+      children.push(new Paragraph('No objectives or scope defined.'));
+    }
+    children.push(new Paragraph(''));
+
+    // 3. Endpoints
+    const eps = uniqueEndpoints(plan);
+    if (eps.length) {
+      children.push(H('Endpoints', 'HEADING_2'));
+      children.push(...tableDocx(['Endpoint'], eps.map(e => [e])));
+      children.push(new Paragraph(''));
+    }
+
+    // 4. Stories & Test Cases
+    if (arr(plan.stories).length) {
+      children.push(H('Stories', 'HEADING_2'));
+      plan.stories.forEach(story => {
+        children.push(H(story.title || 'Story', 'HEADING_3'));
+        children.push(new Paragraph({ children: [new TextRun({ text: 'Story ID: ', bold: true }), new TextRun(story.id || '—')] }));
+        if (story.description) children.push(new Paragraph(story.description));
+        arr(story.testCases).forEach(tc => {
+          children.push(H(`Test Case: ${tc.title}`, 'HEADING_4'));
+          children.push(new Paragraph({ children: [new TextRun({ text: 'Test Case ID: ', bold: true }), new TextRun(tc.id || '—')] }));
+          if (tc.description) children.push(new Paragraph(tc.description));
+          children.push(H('Prerequisites', 'HEADING_5'));
+          ['Valid API endpoints', 'Required authentication', 'Test data available']
+            .forEach(p => children.push(new Paragraph(`• ${p}`)));
+          children.push(H('Validation Criteria', 'HEADING_5'));
+          [
+            'Response status matches expected status',
+            'Response format is valid',
+            'Data integrity is maintained',
+            'Error handling works as expected',
+          ].forEach(v => children.push(new Paragraph(`• ${v}`)));
+          if (arr(tc.steps).length) {
+            children.push(new Paragraph({ children: [B('Steps:')] }));
+            tc.steps.forEach((s, i) => children.push(new Paragraph(`${i + 1}. ${s}`)));
+          }
+          if (tc.expectedResult) {
+            children.push(new Paragraph({ children: [B('Expected Result:')] }));
+            children.push(new Paragraph(tc.expectedResult));
+          }
+          const api = tc.apiDetails;
+          if (api) {
+            children.push(new Paragraph({ children: [B('API Details')] }));
+            const headersStr = safeCellValue(JSON.stringify(api.headers || {}, null, 2));
+            const bodyStr = safeCellValue(api.body || 'N/A');
+            children.push(...tableDocx(
+              ['Method', 'Endpoint', 'Headers', 'Body', 'Expected Status'],
+              [[
+                safeCellValue(api.method),
+                safeCellValue(api.endpoint),
+                headersStr,
+                bodyStr,
+                safeCellValue(String(api.expectedStatus ?? '')),
+              ]]
+            ));
+          }
+          const meta = [
+            tc.severity ? `Severity: ${tc.severity}` : '',
+            tc.priority ? `Priority: ${tc.priority}` : '',
+          ].filter(Boolean);
+          if (meta.length) children.push(new Paragraph(meta.join(' | ')));
+        });
+      });
+      children.push(new Paragraph(''));
+    }
+
+    // 5. Risk Assessment
+    if (arr(plan.riskAssessment).length) {
+      children.push(H('Risk Assessment', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Category', 'Description', 'Mitigation', 'Impact'],
+        plan.riskAssessment!.map(r => [r.category, r.description, r.mitigation, r.impact])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 6. Deliverables
+    if (arr(plan.deliverables).length) {
+      children.push(H('Deliverables', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Title', 'Description', 'Format', 'Frequency'],
+        plan.deliverables!.map(d => [d.title, d.description, d.format, d.frequency])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 7. Success Criteria
+    if (arr(plan.successCriteria).length) {
+      children.push(H('Success Criteria', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Category', 'Criteria', 'Threshold'],
+        plan.successCriteria!.map(s => [s.category, s.criteria, s.threshold])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 8. Roles & Responsibilities
+    if (arr(plan.rolesAndResponsibility).length) {
+      children.push(H('Roles & Responsibilities', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Role', 'Responsibility'],
+        plan.rolesAndResponsibility!.map(r => [r.role, r.responsibility])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 9. Entry Criteria
+    if (arr(plan.entryCriteria).length) {
+      children.push(H('Entry Criteria', 'HEADING_2'));
+      plan.entryCriteria!.forEach(e => children.push(new Paragraph(`• ${e.description}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 10. Exit Criteria
+    if (arr(plan.exitCriteria).length) {
+      children.push(H('Exit Criteria', 'HEADING_2'));
+      plan.exitCriteria!.forEach(e => children.push(new Paragraph(`• ${e.description}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 11. Test Execution Strategy
+    if (arr(plan.testExecutionStrategy).length) {
+      children.push(H('Test Execution Strategy', 'HEADING_2'));
+      plan.testExecutionStrategy!.forEach(e => children.push(new Paragraph(`• ${e.description}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 12. Test Schedule
+    if (arr(plan.testSchedule).length) {
+      children.push(H('Test Schedule', 'HEADING_2'));
+      plan.testSchedule!.forEach(e => children.push(new Paragraph(`• ${e.description}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 13. Tools and Automation Strategy
+    if (arr(plan.toolsAndAutomationStrategy).length) {
+      children.push(H('Tools and Automation Strategy', 'HEADING_2'));
+      plan.toolsAndAutomationStrategy!.forEach(e => children.push(new Paragraph(`• ${e.description}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 14. Approvals and Sign-offs
+    if (arr(plan.approvalsAndSignoffs).length) {
+      children.push(H('Approvals and Sign-offs', 'HEADING_2'));
+      plan.approvalsAndSignoffs!.forEach(e => children.push(new Paragraph(`• ${e.description}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 15. References
+    if (arr(plan.references).length) {
+      children.push(H('References', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Title', 'URL'],
+        plan.references!.map(r => [r.title, r.url])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 16. Test Items
+    if (arr(plan.testItems).length) {
+      children.push(H('Test Items', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['ID', 'Description', 'Endpoint', 'Method'],
+        plan.testItems!.map(i => [i.id, i.description, i.endpoint, i.method])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 17. Features To Be Tested
+    if (arr(plan.featuresToBeTested).length) {
+      children.push(H('Features To Be Tested', 'HEADING_2'));
+      plan.featuresToBeTested!.forEach(f => children.push(new Paragraph(`• ${f}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 18. Features Not To Be Tested
+    if (arr(plan.featuresNotToBeTested).length) {
+      children.push(H('Features Not To Be Tested', 'HEADING_2'));
+      plan.featuresNotToBeTested!.forEach(f => children.push(new Paragraph(`• ${f}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 19. Staffing & Training
+    if (arr(plan.staffingAndTraining).length) {
+      children.push(H('Staffing & Training', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Role', 'Skills'],
+        plan.staffingAndTraining!.map(s => [s.role, s.skills.join(', ')])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 20. Pass Criteria
+    if (arr(plan.passCriteria).length) {
+      children.push(H('Pass Criteria', 'HEADING_2'));
+      plan.passCriteria!.forEach(p => children.push(new Paragraph(`• ${p}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 21. Fail Criteria
+    if (arr(plan.failCriteria).length) {
+      children.push(H('Fail Criteria', 'HEADING_2'));
+      plan.failCriteria!.forEach(f => children.push(new Paragraph(`• ${f}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 22. Suspension Criteria
+    if (arr(plan.suspensionCriteria).length) {
+      children.push(H('Suspension Criteria', 'HEADING_2'));
+      plan.suspensionCriteria!.forEach(s => children.push(new Paragraph(`• ${s}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 23. Environment Requirements
+    if (plan.environmentRequirements) {
+      const hw = arr(plan.environmentRequirements.hardware);
+      const sw = arr(plan.environmentRequirements.software);
+      const max = Math.max(hw.length, sw.length, 1);
+      children.push(H('Environment Requirements', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Hardware', 'Software', 'Network'],
+        Array.from({ length: max }, (_, i) => [
+          hw[i] ?? (i === 0 ? '—' : ''),
+          sw[i] ?? (i === 0 ? '—' : ''),
+          i === 0 ? (plan.environmentRequirements!.network ?? '—') : ''
+        ])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 24. Test Data Requirements
+    if (arr(plan.testDataRequirements).length) {
+      children.push(H('Test Data Requirements', 'HEADING_2'));
+      plan.testDataRequirements!.forEach(d => children.push(new Paragraph(`• ${d}`)));
+      children.push(new Paragraph(''));
+    }
+
+    // 25. Traceability Matrix
+    if (plan.traceabilityMatrix && Object.keys(plan.traceabilityMatrix).length) {
+      children.push(H('Traceability Matrix', 'HEADING_2'));
+      children.push(...tableDocx(
+        ['Requirement ID', 'Test Case IDs'],
+        Object.entries(plan.traceabilityMatrix).map(([req, tcs]) => [req, tcs.join(', ')])
+      ));
+      children.push(new Paragraph(''));
+    }
+
+    // 26. Negative Scenarios
+    if (arr(plan.negativeScenarios).length) {
+      children.push(H('Negative Scenarios', 'HEADING_2'));
+      plan.negativeScenarios!.forEach(n => children.push(new Paragraph(`• ${n}`)));
+      children.push(new Paragraph(''));
+    }
+  }else if (kind === 'testScenario') {
+    // Include Endpoints section for Test Scenarios export (parity with PDF/XLSX)
+    const eps = uniqueEndpoints(plan);
+    if (eps.length) {
+      children.push(H('Endpoints', 'HEADING_2'));
+      children.push(...tableDocx(['Endpoint'], eps.map(e => [e])));
+      children.push(new Paragraph(''));
+    }
+    arr(plan.stories).forEach(story => {
+      children.push(H(`Test Scenario: ${story.title}`, 'HEADING_2'));
+      // Story ID
+      children.push(new Paragraph({ children: [new TextRun({ text: 'Story ID: ', bold: true }), new TextRun(story.id || '—')] }));
+      if (story.description) children.push(new Paragraph(story.description));
+
+      arr(story.testCases).forEach(tc => {
+        children.push(H(tc.title, 'HEADING_3'));
+        // Test Case ID and meta
+        children.push(new Paragraph({ children: [new TextRun({ text: 'Test Case ID: ', bold: true }), new TextRun(tc.id || '—')] }));
+        const meta = [
+          tc.severity ? `Severity: ${tc.severity}` : '',
+          (tc.priority !== undefined && tc.priority !== null) ? `Priority: ${tc.priority}` : '',
+        ].filter(Boolean);
+        if (meta.length) children.push(new Paragraph(meta.join(' | ')));
+        if (tc.description) children.push(new Paragraph(tc.description));
+        // Prerequisites (always above Steps)
+        children.push(H('Prerequisites', 'HEADING_4'));
+        ['Valid API endpoints', 'Required authentication', 'Test data available']
+          .forEach(p => children.push(new Paragraph(`• ${p}`)));
+        // Steps
+        if (arr(tc.steps).length) {
+          children.push(new Paragraph({ children: [B('Steps:')] }));
+          tc.steps.forEach((s, i) => children.push(new Paragraph(`${i + 1}. ${s}`)));
+        }
+        // Expected Outcome
+        if (tc.expectedResult) {
+          children.push(new Paragraph({ children: [B('Expected Outcome:')] }));
+          children.push(new Paragraph(tc.expectedResult));
+        }
+        // API Details
+        if (tc.apiDetails) {
+          children.push(new Paragraph({ children: [B('API Details')] }));
+          children.push(...tableDocx(
+            ['Method', 'Endpoint', 'Headers', 'Body', 'Expected Status'],
+            [[
+              safeCellValue(tc.apiDetails?.method),
+              safeCellValue(tc.apiDetails?.endpoint),
+              safeCellValue(JSON.stringify(tc.apiDetails?.headers || {}, null, 2)),
+              safeCellValue(tc.apiDetails?.body || 'N/A'),
+              safeCellValue(String(tc.apiDetails?.expectedStatus ?? '')),
+            ]]
+          ));
+        }
+        // Validation Criteria
+        children.push(H('Validation Criteria', 'HEADING_4'));
+        [
+          'Response status matches expected status',
+          'Response format is valid',
+          'Data integrity is maintained',
+          'Error handling works as expected',
+        ].forEach(v => children.push(new Paragraph(`• ${v}`)));
+      });
+      children.push(new Paragraph(''));
+    });
+  }else if (kind === 'testCases') {
+    const eps = uniqueEndpoints(plan);
+    if (eps.length) {
+      children.push(H('Endpoints', 'HEADING_2'));
+      children.push(...tableDocx(['Endpoint'], eps.map(e => [e])));
+      children.push(new Paragraph(''));
+    }
+    arr(plan.stories).forEach(story => {
+      arr(story.testCases).forEach(tc => {
+        children.push(H(`Test Case: ${tc.title}`, 'HEADING_2'));
+        // Story reference + Test Case ID
+        children.push(new Paragraph({ children: [new TextRun({ text: 'Story: ', bold: true }), new TextRun(story.title || '—')] }));
+        children.push(new Paragraph({ children: [B('ID: '), new TextRun(tc.id || '—')] }));
+        // Severity / Priority
+        const meta = [
+          tc.severity ? `Severity: ${tc.severity}` : '',
+          (tc.priority !== undefined && tc.priority !== null) ? `Priority: ${tc.priority}` : '',
+        ].filter(Boolean);
+        if (meta.length) children.push(new Paragraph(meta.join(' | ')));
+        if (tc.description) children.push(new Paragraph(tc.description));
+
+        // Prerequisites (always above Steps)
+        children.push(H('Prerequisites', 'HEADING_4'));
+        if (Array.isArray(tc.prerequisites) && tc.prerequisites.length) {
+          tc.prerequisites.forEach(p => children.push(new Paragraph(`• ${p}`)));
+        } else {
+          ['Valid API endpoints', 'Required authentication', 'Test data available']
+            .forEach(p => children.push(new Paragraph(`• ${p}`)));
+        }
+
+        // Steps
+        if (arr(tc.steps).length) {
+          children.push(new Paragraph({ children: [B('Steps:')] }));
+          tc.steps.forEach((s, i) => children.push(new Paragraph(`${i + 1}. ${s}`)));
+        }
+
+        // Validation Criteria
+        children.push(H('Validation Criteria', 'HEADING_4'));
+        const validationCriteria = Array.isArray(tc.validationCriteria) && tc.validationCriteria.length
+          ? tc.validationCriteria
+          : [
+              'Response status matches expected status',
+              'Response format is valid',
+              'Data integrity is maintained',
+              'Error handling works as expected',
+            ];
+        validationCriteria.forEach(v => children.push(new Paragraph(`• ${v}`)));
+
+        // Expected Result
+        if (tc.expectedResult) {
+          children.push(new Paragraph({ children: [B('Expected Result:')] }));
+          children.push(new Paragraph(tc.expectedResult));
+        }
+
+        // API Details
+        if (tc.apiDetails) {
+          children.push(...tableDocx(
+            ['Method', 'Endpoint', 'Headers', 'Body', 'Expected Status'],
+            [[
+              safeCellValue(tc.apiDetails?.method),
+              safeCellValue(tc.apiDetails?.endpoint),
+              safeCellValue(JSON.stringify(tc.apiDetails?.headers || {}, null, 2)),
+              safeCellValue(tc.apiDetails?.body || 'N/A'),
+              safeCellValue(String(tc.apiDetails?.expectedStatus ?? ''))
+            ]]
+          ));
+        }
+        children.push(new Paragraph(''));
+      });
+    });
+  }
+  // No page number footer or pagination in Word export (explicitly required)
+  const doc = new Document({
+    sections: [{
+      children
+    }]
+  });
+  return Packer.toBlob(doc);
+}
+
+// ---------- PDF (uses jsPDF you already import) ----------
+// Draws a styled table in jsPDF with cell borders, word wrapping, header repeat, and page breaks
+
+// PDF Table helper using jsPDF-AutoTable
+function renderPdfTable(
+  pdf: jsPDF,
+  {
+    startY,
+    head,
+    body,
+    widths: _widths,
+    theme = 'grid',
+    fontSize = 10,
+    headFontSize = 10,
+  }: {
+    startY: number;
+    head: string[];
+    body: RowInput[];
+    widths: number[];
+    theme?: UserOptions['theme'];
+    fontSize?: number;
+    headFontSize?: number;
+  }
+): number {
+  // Always preserve full content but break long continuous tokens so autoTable can wrap
+  const processCell = (cell: any) => {
+    if (cell === null || cell === undefined) return '';
+    if (typeof cell === 'string') return breakLongSegments(cell, 100);
+    try {
+      return breakLongSegments(JSON.stringify(cell), 100);
+    } catch (e) {
+      return breakLongSegments(String(cell), 100);
+    }
+  };
+
+  const processRow = (row: RowInput) => (Array.isArray(row) ? row.map(processCell) : [processCell(row)]);
+
+  // Compute dynamic column widths and shrink-to-fit
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const margin = 20; // mm
+  const maxTableWidth = pageWidth - margin * 2;
+
+  // Prefer explicit widths passed in when valid
+  const useProvidedWidths = Array.isArray(_widths) && _widths.length === head.length && _widths.every(n => typeof n === 'number' && !isNaN(n) && n > 0);
+
+  const columns = head.map(h => ({
+    header: String(h || '').toLowerCase(),
+    isTextHeavy: String(h || '').toLowerCase().includes('url') || String(h || '').toLowerCase().includes('endpoint') || String(h || '').toLowerCase().includes('payload') || String(h || '').toLowerCase().includes('body') || String(h || '').toLowerCase().includes('headers') || String(h || '').toLowerCase().includes('description')
+  }));
+
+  // Improved dynamic column widths and shrink-to-fit
+  let colWidths: number[] = [];
+  const MAX_TEXT_COL = 60; // mm, clamp for text-heavy columns
+  const MIN_CELL = 20; // mm, minimum cell width
+  if (head.length === 1) {
+  // Special case: single-column table should take full width (like DOCX)
+  colWidths = [maxTableWidth];
+} else if (head.length === 2) {
+  // Special case: two-column table, split width 40%/60%
+  colWidths = [Math.round(maxTableWidth * 0.4), Math.round(maxTableWidth * 0.6)];
+} else if (useProvidedWidths) {
+    // Use provided relative weights, scale to fit maxTableWidth
+    const totalWeight = _widths.reduce((a, b) => a + b, 0);
+    colWidths = _widths.map((w, i) => {
+      // Clamp text-heavy columns
+      const base = (w / totalWeight) * maxTableWidth;
+      return columns[i].isTextHeavy ? Math.min(base, MAX_TEXT_COL) : Math.max(base, MIN_CELL);
+    });
+    // If sum > maxTableWidth, shrink all proportionally
+    const sum = colWidths.reduce((a, b) => a + b, 0);
+    if (sum > maxTableWidth) {
+      colWidths = colWidths.map(w => Math.max(MIN_CELL, w * (maxTableWidth / sum)));
+    }
+  } else {
+    // Heuristic: give more width to text-heavy columns
+    const base = 1;
+    const weights = columns.map(col => col.isTextHeavy ? 3 : base);
+    const totalWeight = weights.reduce((a, b) => a + b, 0);
+    colWidths = weights.map((w, i) => {
+      const base = (w / totalWeight) * maxTableWidth;
+      return columns[i].isTextHeavy ? Math.min(base, MAX_TEXT_COL) : Math.max(base, MIN_CELL);
+    });
+    // If sum > maxTableWidth, shrink all proportionally
+    const sum = colWidths.reduce((a, b) => a + b, 0);
+    if (sum > maxTableWidth) {
+      colWidths = colWidths.map(w => Math.max(MIN_CELL, w * (maxTableWidth / sum)));
+    }
+  }
+
+  // Always wrap text, ensure row height adapts
+  const columnStyles: any = {};
+  columns.forEach((col, i) => {
+    columnStyles[i] = {
+      cellWidth: colWidths[i],
+      minCellWidth: MIN_CELL,
+      maxCellWidth: col.isTextHeavy ? MAX_TEXT_COL : colWidths[i],
+      valign: 'top',
+      halign: 'left',
+      cellPadding: 2,
+      overflow: 'linebreak', // always wrap
+    };
+  });
+
+  const runAutoTable = (
+    pdfInstance: jsPDF,
+    chunkBody: RowInput[],
+    startYVal: number,
+    usedFontSize: number,
+    usedHeadFontSize: number
+  ) => {
+    autoTable(pdfInstance, {
+      startY: startYVal,
+      theme,
+      head: [head],
+      body: chunkBody as RowInput[],
+      styles: {
+        font: 'courier',
+        fontSize: usedFontSize,
+        overflow: 'linebreak',
+        cellPadding: 4,
+        halign: 'left',
+        valign: 'top',
+      },
+      headStyles: {
+        font: 'helvetica',
+        fontStyle: 'bold',
+        fontSize: usedHeadFontSize,
+        fillColor: [230, 230, 230],
+        textColor: [0, 0, 0],
+        halign: 'left',
+        valign: 'top',
+      },
+      columnStyles,
+      margin: { left: margin / 2, right: margin / 2, top: 10, bottom: 10 },
+      didParseCell: (data) => {
+        if (data.cell && typeof data.cell.raw === 'string') {
+          (data.cell.styles as any).cellPadding = 4;
+        }
+      }
+    });
+  };
+
+  if (!body || (Array.isArray(body) && body.length === 0)) return startY;
+
+  const processedBody = (body as RowInput[]).map(processRow);
+  let currentY = startY;
+  const DEFAULT_MAX_ROWS_PER_TABLE = Number.MAX_SAFE_INTEGER;
+  let rowsPerTable = DEFAULT_MAX_ROWS_PER_TABLE;
+
+  try {
+    for (let i = 0; i < processedBody.length; i += rowsPerTable) {
+      const chunk = processedBody.slice(i, i + rowsPerTable);
+      runAutoTable(pdf, chunk, currentY, fontSize, headFontSize);
+      // Use unified spacer helper to provide consistent spacing after PDF tables
+      currentY = addTableSpacer('pdf', { pdf, currentY });
+    }
+    return addTableSpacer('pdf', { pdf, currentY });
+  } catch (err) {
+    try {
+      rowsPerTable = Math.max(10, Math.floor(rowsPerTable / 2));
+      for (let i = 0; i < processedBody.length; i += rowsPerTable) {
+        const chunk = processedBody.slice(i, i + rowsPerTable);
+        runAutoTable(pdf, chunk, currentY, Math.max(8, fontSize - 2), Math.max(8, headFontSize - 2));
+        currentY = addTableSpacer('pdf', { pdf, currentY });
+      }
+      return addTableSpacer('pdf', { pdf, currentY });
+    } catch (err2) {
+      throw err2;
+    }
+  }
+}
+
+
+function drawTextBlock(pdf: jsPDF, text: string, cursor: { y: number }, step: number = 7) {
+  const lines: string[] = pdf.splitTextToSize(text, 180);
+  lines.forEach((ln: string) => {
+    if (cursor.y > 280) {
+      pdf.addPage();
+      cursor.y = 10;
+    }
+    pdf.text(ln, 10, cursor.y);
+    cursor.y += step;
+  });
+}
+
+
+async function buildPdfBlob(kind: ArtifactKind, plan: TestPlan): Promise<Blob> {
+  const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const cursor = { y: 10 };
+
+  const H = (txt: string, size: number) => {
+    pdf.setFont('helvetica', 'bold');
+    pdf.setFontSize(size);
+    drawTextBlock(pdf, txt, cursor, 8);
+    pdf.setFont('helvetica', 'normal');
+    pdf.setFontSize(12);
+    cursor.y += 2;
+  };
+
+  // Title logic: only show if plan.title is non-empty
+  const prefix =
+    kind === 'testPlan'     ? 'Test Plan' :
+    kind === 'testScenario' ? 'Test Scenarios' :
+    kind === 'testCases'    ? 'Test Cases' : '';
+  const title = plan.title ? `${prefix}: ${plan.title}` : '';
+  if (title) H(title, 18);
+
+  if (kind === 'testPlan' && plan.description) {
+    H('Overview', 14);
+    drawTextBlock(pdf, plan.description, cursor);
+    cursor.y += 2;
+  }
+
+  const eps = uniqueEndpoints(plan);
+  if (eps.length) {
+    H('Endpoints', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Endpoint'],
+      body: eps.map(e => [e]),
+      widths: [1],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  if (arr(plan.stories).length) {
+    H('Stories', 14);
+    plan.stories.forEach((story) => {
+      H(story.title || 'Story', 13);
+      // Show Story ID under heading
+      drawTextBlock(pdf, `Story ID: ${story.id ?? '—'}`, cursor);
+      if (story.description) drawTextBlock(pdf, story.description, cursor);
+
+      arr(story.testCases).forEach((tc) => {
+        H(`Test Case: ${tc.title}`, 12);
+        // Show Test Case ID under heading
+        drawTextBlock(pdf, `TC ID: ${tc.id ?? '—'}`, cursor);
+        if (tc.description) drawTextBlock(pdf, tc.description, cursor);
+
+        // Prerequisites always above Steps
+        H('Prerequisites', 12);
+        if (Array.isArray(tc.prerequisites) && tc.prerequisites.length) {
+          tc.prerequisites.forEach(p => drawTextBlock(pdf, `• ${p}`, cursor));
+        } else {
+          ['Valid API endpoints', 'Required authentication', 'Test data available']
+            .forEach(p => drawTextBlock(pdf, `• ${p}`, cursor));
+        }
+        H('Validation Criteria', 12);
+        const validationCriteria = Array.isArray(tc.validationCriteria) && tc.validationCriteria.length
+          ? tc.validationCriteria
+          : [
+              'Response status matches expected status',
+              'Response format is valid',
+              'Data integrity is maintained',
+              'Error handling works as expected',
+            ];
+        validationCriteria.forEach(v => drawTextBlock(pdf, `• ${v}`, cursor));
+        if (arr(tc.steps).length) {
+          drawTextBlock(pdf, 'Steps:', cursor);
+          tc.steps.forEach((s, i) => drawTextBlock(pdf, `${i + 1}. ${s}`, cursor));
+        }
+        if (tc.expectedResult) {
+          drawTextBlock(pdf, 'Expected Result:', cursor);
+          drawTextBlock(pdf, tc.expectedResult, cursor);
+        }
+        const api = tc.apiDetails;
+        if (api) {
+          H('API Details:', 12);
+          cursor.y = renderPdfTable(pdf, {
+            startY: cursor.y,
+            head: ['Method', 'Endpoint', 'Headers', 'Body', 'Expected Status'],
+            body: [[
+              api.method ?? '',
+              api.endpoint ?? '',
+              JSON.stringify(api.headers || {}, null, 2),
+              api.body || 'N/A',
+              String(api.expectedStatus ?? ''),
+            ]],
+            widths: [1, 4, 2, 2, 1],
+            theme: 'grid',
+            fontSize: 10,
+            headFontSize: 10,
+          });
+        }
+        const meta = [
+          tc.severity ? `Severity: ${tc.severity}` : '',
+          tc.priority ? `Priority: ${tc.priority}` : '',
+        ].filter(Boolean);
+        if (meta.length) drawTextBlock(pdf, meta.join(' | '), cursor);
+        cursor.y += 2;
+      });
+      cursor.y += 2;
+    });
+  }
+
+  // Risk Assessment Table
+  if (kind === 'testPlan' && arr(plan.riskAssessment).length) {
+    H('Risk Assessment', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Category', 'Description', 'Mitigation', 'Impact'],
+      body: plan.riskAssessment!.map(r => [r.category, r.description, r.mitigation, r.impact]),
+      widths: [1, 4, 3, 1],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Deliverables Table
+  if (kind === 'testPlan' && arr(plan.deliverables).length) {
+    H('Deliverables', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Title', 'Description', 'Format', 'Frequency'],
+      body: plan.deliverables!.map(d => [d.title, d.description, d.format, d.frequency]),
+      widths: [1, 2, 1, 1],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Success Criteria Table
+  if (kind === 'testPlan' && arr(plan.successCriteria).length) {
+    H('Success Criteria', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Category', 'Criteria', 'Threshold'],
+      body: plan.successCriteria!.map(s => [s.category, s.criteria, s.threshold]),
+      widths: [1, 4, 1],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Roles & Responsibilities Table
+  if (kind === 'testPlan' && arr(plan.rolesAndResponsibility).length) {
+    H('Roles & Responsibilities', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Role', 'Responsibility'],
+      body: plan.rolesAndResponsibility!.map(r => [r.role, r.responsibility]),
+      widths: [1, 2],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // References Table
+  if (kind === 'testPlan' && arr(plan.references).length) {
+    H('References', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Title', 'URL'],
+      body: plan.references!.map(r => [r.title, r.url]),
+      widths: [1, 2],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Test Items Table
+  if (kind === 'testPlan' && arr(plan.testItems).length) {
+    H('Test Items', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['ID', 'Description', 'Endpoint', 'Method'],
+      body: plan.testItems!.map(i => [i.id, i.description, i.endpoint, i.method]),
+      widths: [1, 2, 2, 1],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Environment Requirements Table
+  if (kind === 'testPlan' && plan.environmentRequirements) {
+    const hw = arr(plan.environmentRequirements.hardware);
+    const sw = arr(plan.environmentRequirements.software);
+    const max = Math.max(hw.length, sw.length, 1);
+    H('Environment Requirements', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Hardware', 'Software', 'Network'],
+      body: Array.from({ length: max }, (_, i) => [
+        hw[i] ?? (i === 0 ? '—' : ''),
+        sw[i] ?? (i === 0 ? '—' : ''),
+        i === 0 ? (plan.environmentRequirements!.network ?? '—') : ''
+      ]),
+      widths: [1, 1, 2],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Traceability Matrix Table
+  if (kind === 'testPlan' && plan.traceabilityMatrix && Object.keys(plan.traceabilityMatrix).length) {
+    H('Traceability Matrix', 14);
+    cursor.y = renderPdfTable(pdf, {
+      startY: cursor.y,
+      head: ['Requirement ID', 'Test Case IDs'],
+      body: Object.entries(plan.traceabilityMatrix).map(([req, tcs]) => [req, tcs.join(', ')]),
+      widths: [1, 2],
+      theme: 'grid',
+      fontSize: 10,
+      headFontSize: 10,
+    });
+  }
+
+  // Add missing Test Plan sections for PDF parity
+  if (kind === 'testPlan') {
+    if ((plan.featuresToBeTested ?? []).length) {
+      H('Features To Be Tested', 14);
+      cursor.y = renderPdfTable(pdf, {
+        startY: cursor.y, head: ['Feature'],
+        body: (plan.featuresToBeTested ?? []).map(f => [f]), widths: [1], theme: 'grid', fontSize: 10, headFontSize: 10
+      });
+    }
+    if ((plan.featuresNotToBeTested ?? []).length) {
+      H('Features Not To Be Tested', 14);
+      cursor.y = renderPdfTable(pdf, {
+        startY: cursor.y, head: ['Feature'],
+        body: (plan.featuresNotToBeTested ?? []).map(f => [f]), widths: [1], theme: 'grid', fontSize: 10, headFontSize: 10
+      });
+    }
+    if ((plan.staffingAndTraining ?? []).length) {
+      H('Staffing & Training', 14);
+      cursor.y = renderPdfTable(pdf, {
+        startY: cursor.y, head: ['Role','Skills'],
+        body: plan.staffingAndTraining!.map(s => [s.role, (s.skills ?? []).join(', ')]),
+        widths: [1,2], theme: 'grid', fontSize: 10, headFontSize: 10
+      });
+    }
+    const listBlock = (title: string, items?: string[]) => {
+      if ((items ?? []).length) {
+        H(title, 14);
+        cursor.y = renderPdfTable(pdf, {
+          startY: cursor.y, head: ['Item'], body: items!.map(i => [i]), widths: [1], theme: 'grid', fontSize: 10, headFontSize: 10
+        });
+      }
+    };
+    // Parity lists also present in DOCX/XLSX:
+    listBlock('Entry Criteria', (plan.entryCriteria ?? []).map(e => e.description));
+    listBlock('Exit Criteria', (plan.exitCriteria ?? []).map(e => e.description));
+    listBlock('Test Execution Strategy', (plan.testExecutionStrategy ?? []).map(e => e.description));
+    listBlock('Test Schedule', (plan.testSchedule ?? []).map(e => e.description));
+    listBlock('Tools & Automation Strategy', (plan.toolsAndAutomationStrategy ?? []).map(e => e.description));
+    listBlock('Approvals & Sign-offs', (plan.approvalsAndSignoffs ?? []).map(e => e.description));
+    listBlock('Pass Criteria', plan.passCriteria);
+    listBlock('Fail Criteria', plan.failCriteria);
+    listBlock('Suspension Criteria', plan.suspensionCriteria);
+    listBlock('Test Data Requirements', plan.testDataRequirements);
+    listBlock('Negative Scenarios', plan.negativeScenarios);
+  }
+
+  // No page number footer or pagination in PDF export (explicitly required)
+  return pdf.output('blob');
+}
+
+
+
+async function buildXlsxBlob(kind: ArtifactKind, plan: TestPlan): Promise<Blob> {
+  // Dynamically import browser build (use minified for browser reliability)
+  const { default: XlsxPopulate } = await import("xlsx-populate/browser/xlsx-populate.min.js");
+  // Helpers for parity
+  const addListSheet = (wb: any, name: string, header: string, items?: string[]) => {
+    const rows = (items ?? []).map(v => [v === null || v === undefined ? '' : String(v)]);
+    if (rows.length) addSheet(wb, name, [header], rows);
+  };
+  const addPairsSheet = (wb: any, name: string, headers: string[], rows: (string | number | undefined)[][]) => {
+    if (rows.length) addSheet(wb, name, headers, rows.map(r => r.map(c => c === null || c === undefined ? '' : String(c))));
+  };
+  const wb = await XlsxPopulate.fromBlankAsync();
+
+  const addSheet = (wbInstance: any, name: string, headers: string[], rows: (string | number | undefined)[][]) => {
+    // Sheet name max 31 chars
+    const baseName = (name || "Sheet").slice(0, 31);
+
+    // Do not truncate cell content; insert line breaks into long segments so Excel will wrap
+    const normRows = rows.map(r => r.map(c => c === null || c === undefined ? '' : breakLongSegments(String(c), 100)));
+
+    const totalRows = normRows.length;
+    // If no data, still create or reuse a sheet and write headers only
+    if (totalRows === 0) {
+      let sheet: any;
+      const firstSheet = wbInstance.sheets()[0];
+      const firstUsed = (firstSheet && typeof firstSheet.usedRange === 'function') ? firstSheet.usedRange() : null;
+      if (wbInstance.sheets().length === 1 && (!firstUsed || firstUsed === null)) {
+        sheet = firstSheet;
+        try { sheet.name(baseName); } catch (e) { /* ignore rename failures */ }
+      } else {
+        sheet = wbInstance.addSheet(baseName.slice(0,31));
+      }
+      try {
+        sheet.cell(1, 1).value([headers]);
+        try { sheet.freezePanes(2, 1); if (headers.length > 0) sheet.autoFilter(sheet.range(`A1:${colLetter(headers.length)}1`)); } catch(e){}
+      } catch (e) {}
+      return sheet;
+    }
+
+    let part = 1;
+    for (let i = 0; i < normRows.length; i += XLSX_MAX_ROWS_PER_SHEET) {
+      const chunk = normRows.slice(i, i + XLSX_MAX_ROWS_PER_SHEET);
+      const sheetName = (totalRows > XLSX_MAX_ROWS_PER_SHEET) ? `${baseName}_${part}`.slice(0,31) : baseName.slice(0,31);
+
+      let sheet: any;
+      const firstSheet = wbInstance.sheets()[0];
+      const firstUsed = (firstSheet && typeof firstSheet.usedRange === 'function') ? firstSheet.usedRange() : null;
+
+      // Reuse the initial blank sheet for the very first chunk only when workbook is empty
+      if (part === 1 && wbInstance.sheets().length === 1 && (!firstUsed || firstUsed === null)) {
+        sheet = firstSheet;
+        try { sheet.name(sheetName); } catch (e) { /* ignore rename failures */ }
+      } else {
+        sheet = wbInstance.addSheet(sheetName);
+      }
+
+      const data = [headers, ...chunk];
+      try {
+        sheet.cell(1, 1).value(data);
+      } catch (e) {
+        // Some environments may be restrictive; try fallback
+        try { sheet.cell(1,1).value([headers]); for (let r = 0; r < chunk.length; r++) sheet.cell(r+2,1).value(chunk[r]); } catch (e2) { }
+      }
+
+      // Auto column sizing heuristic: compute max characters per column
+      try {
+        const colCount = headers.length || (data[0] || []).length;
+        const maxChars = new Array(colCount).fill(0);
+        for (let r = 0; r < data.length; r++) {
+          const row = data[r] as any[];
+          for (let c = 0; c < colCount; c++) {
+            const cellText = String((row && row[c]) ?? '');
+            maxChars[c] = Math.max(maxChars[c] || 0, cellText.split('\n').reduce((acc, ln) => Math.max(acc, ln.length), 0));
+          }
+        }
+        for (let c = 0; c < maxChars.length; c++) {
+          const wch = Math.min(50, Math.max(8, Math.ceil(maxChars[c] * 1.2)));
+          try { sheet.column(c + 1).width(wch); } catch (e) { }
+        }
+      } catch (e) { }
+
+      // Style headers
+      try {
+        const headerRange = sheet.range(1, 1, 1, headers.length);
+        headerRange.style({ bold: true, fill: "D9E1F2", horizontalAlignment: "left", verticalAlignment: "top" });
+        headerRange.style({ border: { style: "thin", color: "D0D0D0" } });
+      } catch (e) { }
+
+      // Body styling, wrapText and alternating row fill
+      const lastRow = chunk.length + 1;
+      if (lastRow >= 2) {
+        try {
+          const bodyRange = sheet.range(2, 1, lastRow, headers.length);
+          bodyRange.style({ wrapText: true, verticalAlignment: "top" });
+          bodyRange.style({ border: { style: "thin", color: "E0E0E0" } });
+        } catch (e) { }
+
+        for (let r = 2; r <= lastRow; r++) {
+          try {
+            const rowVals = sheet.row(r).value();
+            const cells = Array.isArray(rowVals) ? rowVals : [rowVals];
+            let maxLines = 1;
+            for (let ci = 0; ci < cells.length; ci++) {
+              try {
+                const cellText = String(cells[ci] ?? '');
+                const lines = cellText.split('\n').length;
+                maxLines = Math.max(maxLines, lines);
+                // Monospace font for text-heavy columns
+                if (/url|endpoint|payload|body|headers|description/i.test(headers[ci])) {
+                  sheet.cell(r, ci + 1).style({ fontFamily: 'Consolas' });
+                } else {
+                  sheet.cell(r, ci + 1).style({ fontFamily: 'Calibri' });
+                }
+                // Padding for all cells
+                sheet.cell(r, ci + 1).style({ left: 4, right: 4, top: 4, bottom: 4 });
+              } catch (e) { }
+            }
+            try { sheet.row(r).height(Math.max(15, 15 * maxLines)); } catch (e) { }
+            if (r % 2 === 0) try { sheet.row(r).style({ fill: "F7F7F7" }); } catch (e) { }
+          } catch (e) { }
+        }
+      }
+
+      try {
+        sheet.freezePanes(2, 1);
+        if (headers.length > 0) sheet.autoFilter(sheet.range(`A1:${colLetter(headers.length)}1`));
+      } catch (err) {
+        // ignore sheet styling failures in some browsers/environments
+      }
+      // Ensure a blank row separates tables in Excel exports
+      try { addTableSpacer('xlsx', { sheet, lastRow }); } catch (e) { /* ignore */ }
+
+      part++;
+    }
+    return wbInstance.sheet(baseName);
+  };
+
+  // Overview (testPlan only)
+  if (kind === "testPlan") {
+    addSheet(wb, "Overview", ["Title", "Description"], [[safeCellValue(plan.title || ""), safeCellValue(plan.description || "")]]);
+  }
+
+  // Endpoints
+  const eps = uniqueEndpoints(plan);
+  if (eps.length) {
+    addSheet(wb, "Endpoints", ["Endpoint"], eps.map(e => [safeCellValue(e)]));
+  }
+
+  // Stories
+  if ((plan.stories || []).length) {
+    addSheet(wb, "Stories", ["Story Title", "Story ID", "Description", "# Test Cases"], plan.stories!.map(s => [safeCellValue(s.title), safeCellValue(s.id), safeCellValue(s.description || ""), (s.testCases || []).length]));
+  }
+
+  // TestCases (wrap long text)
+  const tcRows: (string | number | undefined)[][] = [];
+  (plan.stories || []).forEach(s =>
+    (s.testCases || []).forEach(tc => {
+      tcRows.push([
+        safeCellValue(s.title),
+        safeCellValue(tc.title),
+        safeCellValue(tc.id),
+        safeCellValue(tc.description || ""),
+        safeCellValue(tc.apiDetails?.method || ""),
+        safeCellValue(tc.apiDetails?.endpoint || ""),
+        safeCellValue(JSON.stringify(tc.apiDetails?.headers || {}, null, 2)),
+        safeCellValue(tc.apiDetails?.body || "N/A"),
+        safeCellValue(tc.apiDetails?.expectedStatus ?? ""),
+        // Prerequisites (always above Steps)
+        safeCellValue(['Valid API endpoints', 'Required authentication', 'Test data available'].join("\n")),
+        // Steps
+        safeCellValue((tc.steps || []).join("\n")),
+        // Validation Points
+        safeCellValue([
+          `Status code should be ${tc.apiDetails?.expectedStatus ?? ''}`,
+          'Response format should match API specification',
+          'Error handling should be implemented',
+          'Data integrity should be maintained',
+        ].join("\n")),
+        safeCellValue(tc.expectedResult || ""),
+        safeCellValue(tc.severity || ""),
+        safeCellValue(tc.priority ?? ""),
+      ]);
+    })
+  );
+  // Only add the detailed "TestCases" sheet for full test plans — skip when exporting testScenario Excel (Scenarios sheet will be used instead)
+  if (kind !== "testScenario" && tcRows.length) {
+    addSheet(wb, "TestCases", ["Story", "Test Case", "TC ID", "Description", "Method", "Endpoint", "Headers", "Body", "Expected Status", "Prerequisites", "Steps", "Validation Criteria", "Expected Result", "Severity", "Priority"], tcRows);
+  }
+  // Add all missing Test Plan sections as sheets
+  if (kind === "testPlan") {
+    addPairsSheet(wb, "Deliverables",
+      ["Title", "Description", "Format", "Frequency"],
+      (plan.deliverables ?? []).map(d => [d.title, d.description, d.format, d.frequency])
+    );
+    addPairsSheet(wb, "SuccessCriteria",
+      ["Category", "Criteria", "Threshold"],
+      (plan.successCriteria ?? []).map(s => [s.category, s.criteria, s.threshold])
+    );
+    addPairsSheet(wb, "RolesResponsibilities",
+      ["Role", "Responsibility"],
+      (plan.rolesAndResponsibility ?? []).map(r => [r.role, r.responsibility])
+    );
+    addPairsSheet(wb, "References",
+      ["Title", "URL"],
+      (plan.references ?? []).map(r => [r.title, r.url])
+    );
+    addPairsSheet(wb, "TestItems",
+      ["ID", "Description", "Endpoint", "Method"],
+      (plan.testItems ?? []).map(i => [i.id, i.description, i.endpoint, i.method])
+    );
+    addListSheet(wb, "FeaturesToBeTested", "Feature", plan.featuresToBeTested ?? []);
+    addListSheet(wb, "FeaturesNotToBeTested", "Feature", plan.featuresNotToBeTested ?? []);
+    addPairsSheet(wb, "StaffingAndTraining",
+      ["Role", "Skills"],
+      (plan.staffingAndTraining ?? []).map(s => [s.role, (s.skills ?? []).join(", ")])
+    );
+    addListSheet(wb, "PassCriteria", "Criteria", plan.passCriteria ?? []);
+    addListSheet(wb, "FailCriteria", "Criteria", plan.failCriteria ?? []);
+    addListSheet(wb, "SuspensionCriteria", "Criteria", plan.suspensionCriteria ?? []);
+    addListSheet(wb, "TestDataRequirements", "Requirement", plan.testDataRequirements ?? []);
+    addListSheet(wb, "NegativeScenarios", "Scenario", plan.negativeScenarios ?? []);
+    addListSheet(wb, "EntryCriteria", "Description", (plan.entryCriteria ?? []).map(e => e.description));
+    addListSheet(wb, "ExitCriteria", "Description", (plan.exitCriteria ?? []).map(e => e.description));
+    addListSheet(wb, "TestExecutionStrategy", "Description", (plan.testExecutionStrategy ?? []).map(e => e.description));
+    addListSheet(wb, "TestSchedule", "Description", (plan.testSchedule ?? []).map(e => e.description));
+    addListSheet(wb, "ToolsAndAutomation", "Description", (plan.toolsAndAutomationStrategy ?? []).map(e => e.description));
+    addListSheet(wb, "ApprovalsAndSignoffs", "Description", (plan.approvalsAndSignoffs ?? []).map(e => e.description));
+    // Environment Requirements (multi-row)
+    if (plan.environmentRequirements) {
+      const hw = arr(plan.environmentRequirements.hardware);
+      const sw = arr(plan.environmentRequirements.software);
+      const max = Math.max(hw.length, sw.length, 1);
+      const rows = Array.from({ length: max }, (_, i) => [
+        hw[i] ?? (i === 0 ? "—" : ""),
+        sw[i] ?? (i === 0 ? "—" : ""),
+        i === 0 ? (plan.environmentRequirements!.network ?? "—") : ""
+      ]);
+      addPairsSheet(wb, "EnvironmentRequirements", ["Hardware", "Software", "Network"], rows);
+    }
+  }
+  // Scenarios sheet for testScenario (Prerequisites above Steps)
+  if (kind === "testScenario" && (plan.stories || []).length) {
+    const rows: (string | number | undefined)[][] = [];
+    (plan.stories || []).forEach(story =>
+      (story.testCases || []).forEach(tc => {
+        rows.push([
+          safeCellValue(story.title),
+          safeCellValue(story.id || ""),
+          safeCellValue(tc.title),
+          safeCellValue(tc.id || ""),
+          safeCellValue(tc.description || ""),
+          // Prerequisites (always above Steps)
+          safeCellValue(['Valid API endpoints','Required authentication','Test data available'].join("\n")),
+          safeCellValue((tc.steps || []).join("\n")),
+          safeCellValue(tc.expectedResult || ""),
+          safeCellValue(tc.apiDetails?.method || ""),
+          safeCellValue(tc.apiDetails?.endpoint || ""),
+          safeCellValue(tc.apiDetails?.expectedStatus ?? ""),
+          // Validation
+          safeCellValue(
+            Array.isArray(tc.validationCriteria) && tc.validationCriteria.length
+              ? tc.validationCriteria.join("\n")
+              : [
+                  'Response status matches expected status',
+                  'Response format is valid',
+                  'Data integrity is maintained',
+                  'Error handling works as expected',
+                ].join("\n")
+          ),
+          // Severity & Priority for parity
+          safeCellValue(tc.severity || ""),
+          safeCellValue(tc.priority ?? ""),
+        ]);
+      })
+    );
+    if (rows.length) {
+      addSheet(wb, "Scenarios", ["Story", "Story ID", "Scenario", "TC ID", "Description", "Prerequisites", "Steps", "Expected Outcome", "Method", "Endpoint", "Expected Status", "Validation Criteria", "Severity", "Priority"], rows);
+    }
+  }
+
+  // Risk (testPlan)
+  if (kind === "testPlan" && (plan.riskAssessment || []).length) {
+    addSheet(wb, "Risk", ["Category", "Description", "Mitigation", "Impact"], plan.riskAssessment!.map(r => [safeCellValue(r.category), safeCellValue(r.description), safeCellValue(r.mitigation), safeCellValue(r.impact)]));
+  }
+
+  // Traceability (testPlan)
+  if (kind === "testPlan" && plan.traceabilityMatrix && Object.keys(plan.traceabilityMatrix).length) {
+    addSheet(wb, "Traceability", ["Requirement ID", "Test Case IDs"], Object.entries(plan.traceabilityMatrix).map(([req, tcs]) => [safeCellValue(req), safeCellValue(tcs.join(", "))]));
+  }
+
+  // Return blob (no footer, no page number, no pagination in Excel export as required)
+  const ab = await wb.outputAsync();
+  return new Blob([ab], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+// Ensure formatPayload is defined before extractApiEndpoints to avoid ReferenceError
+function formatPayload(payload: any): string {
+  if (payload === undefined || payload === null) return '';
+  try {
+    if (typeof payload === 'string') {
+      const s = payload.trim();
+      // If it looks like JSON, pretty-print it for display
+      if (s.startsWith('{') || s.startsWith('[')) {
+        const parsed = JSON.parse(s);
+        return JSON.stringify(parsed, null, 2);
+      }
+      return payload;
+    }
+    // For non-string payloads, stringify with indentation
+    return JSON.stringify(payload, null, 2);
+  } catch (err) {
+    // If parsing fails, fall back to string representation
+    return typeof payload === 'string' ? payload : String(payload);
+  }
+}
 
   const handleGenerate = async () => {
-    if (!file || !selectedType || !selectedFormat) return;
-
-    setStatus('processing');
-    setFunnyMessage('Grab a cup of tea or coffee and relax while we prepare your file. This might take a moment! ☕😊');
-
     try {
-      const fileContent = await file.text();
-      const harEntries = parseHarFile(fileContent);
+      // initialize to avoid use-before-assigned errors
+      let fileBlob: Blob | undefined = undefined;
+      let filename: string | undefined = undefined;
 
-      // 🚀 Pass in the progress callback
+      if (!file || !selectedType || !selectedFormat) {
+        return;
+      }
+
+      setStatus('processing');
+      setFunnyMessage('Grab a cup of tea or coffee and relax while we prepare your file. This might take a moment! ☕😊');
+
+      const fileContent = await file.text();
+
+      let harEntries;
+      try {
+        harEntries = parseHarFile(fileContent);
+      } catch (parseErr: any) {
+        throw new Error('no valid endpoints');
+      }
+
+      if (!Array.isArray(harEntries) || harEntries.length === 0) {
+        throw new Error('no valid endpoints');
+      }
+
       const generatedTestPlan = await generateTestPlan(harEntries, selectedType, (percent) => {
         setProgress(percent);
         setFunnyMessage(getFunnyMessage(percent));
       });
 
-      // If config is missing or response is invalid, show generic config error
-      if (!generatedTestPlan || !generatedTestPlan.stories || !Array.isArray(generatedTestPlan.stories)) {
-        setStatus('error');
-        setErrorMessage('There seems to be an OpenAI configuration or model setup issue. Please check your settings and try again.');
-        setShowErrorModal(true);
-        return;
+      if (!generatedTestPlan || !generatedTestPlan.stories || !Array.isArray(generatedTestPlan.stories) || generatedTestPlan.stories.length === 0) {
+        throw new Error('no valid endpoints');
       }
 
       setTestPlan(generatedTestPlan);
       setProgress(100);
 
       const content = generateContent(selectedType, generatedTestPlan);
-      let extension;
-      let filename = `generated-${selectedType}`;
-      let fileBlob: Blob;
 
-      // ...existing code...
-      if (selectedType === 'code') {
-        fileBlob = new Blob([content], { type: 'text/typescript' });
-        extension = '.spec.ts';
-        filename += extension;
-      } else if (selectedFormat === 'md') {
-        const markdownContent = content;
-        fileBlob = new Blob([markdownContent], { type: 'text/markdown' });
-        extension = '.md';
-        filename += extension;
-      } else if (selectedFormat === 'txt') {
-        fileBlob = new Blob([content], { type: 'text/plain' });
-        extension = '.txt';
-        filename += extension;
-      }  else if (selectedFormat === 'pdf') {
-        const pdf = new jsPDF({
-          orientation: 'portrait',
-          unit: 'mm',
-          format: 'a4',
-        });
-
-        const lines: string[] = pdf.splitTextToSize(content, 180);
-        let y = 10;
-
-        lines.forEach((line: string) => {
-          if (y > 280) {
-            pdf.addPage();
-            y = 10;
-          }
-          pdf.text(line, 10, y);
-          y += 7;
-        });
-
-        // 🚨 Important: get the blob using async/await!
-        fileBlob = await pdf.output('blob');
-        filename += '.pdf';
-      } else if (selectedFormat === 'xlsx') {
-        const lines = content.split('\n');
-
-        // Each line will be one row with one cell
-        const worksheet = XLSX.utils.aoa_to_sheet(lines.map(line => [line]));
-        const workbook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(workbook, worksheet, 'TestArtifact');
-
-        const xlsxBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
-        fileBlob = new Blob([xlsxBuffer], {
-          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        });
-        extension = '.xlsx';
-        filename += extension;
-      } else if (selectedFormat === 'docx') {
-        // Create Paragraphs from each line of content
-        const lines = content.split('\n').map(line => 
-          new Paragraph({
-            children: [new TextRun(line)],
-          })
-        );
-
-        const doc = new Document({
-          sections: [{
-            properties: {},
-            children: lines,
-          }],
-        });
-
-        const docBuffer = await Packer.toBlob(doc);
-        fileBlob = docBuffer;
-        extension = '.docx';
-        filename += extension;
-      } else {
-        throw new Error('Invalid selected format.');
+      // Build export blob
+      try {
+        if (selectedType === 'code') {
+          fileBlob = new Blob([content], { type: 'text/typescript' });
+          filename = `generated-${selectedType}.spec.ts`;
+        } else if (selectedFormat === 'md') {
+          fileBlob = new Blob([content], { type: 'text/markdown' });
+          filename = `generated-${selectedType}.md`;
+        } else if (selectedFormat === 'txt') {
+          fileBlob = new Blob([content], { type: 'text/plain' });
+          filename = `generated-${selectedType}.txt`;
+        } else if (selectedFormat === 'pdf') {
+          fileBlob = await buildPdfBlob(selectedType, generatedTestPlan);
+          filename = `generated-${selectedType}.pdf`;
+        } else if (selectedFormat === 'xlsx') {
+          fileBlob = await buildXlsxBlob(selectedType, generatedTestPlan);
+          filename = `generated-${selectedType}.xlsx`;
+        } else if (selectedFormat === 'docx') {
+                   fileBlob = await buildDocxBlob(selectedType, generatedTestPlan);
+          filename = `generated-${selectedType}.docx`;
+        } else {
+          throw new Error('Invalid selected format.');
+        }
+      } catch (exportErr) {
+        throw exportErr;
       }
 
-      // Create a download link and trigger the download
-      //const blob = new Blob([content], { type: 'text/plain' });
-      const url = URL.createObjectURL(fileBlob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      // If blob created, trigger download
+      try {
+        if (fileBlob) {
+          const downloadUrl = URL.createObjectURL(fileBlob);
+          const a = document.createElement('a');
+          a.href = downloadUrl;
+          a.download = filename ?? 'generated-artifact';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          try { URL.revokeObjectURL(downloadUrl); } catch (revokeErr) { }
+          setStatus('success');
+        } else {
+          if (generatedTestPlan) {
+            setStatus('success');
+          } else {
+            setStatus('error');
+          }
+        }
+      } catch (downloadErr) {
+        setStatus('error');
+        setErrorMessage('Failed to download the generated artifact. Check console for details.');
+        setShowErrorModal(true);
+      }
 
       // Save to history
-      setHistory(prevHistory => [...prevHistory, { file, testPlan, selectedType, apiEndpoints, status }]);
-      setStatus('success');
-    } catch (error) {
+      setHistory(prevHistory => [...prevHistory, { file, testPlan: generatedTestPlan, selectedType, apiEndpoints, status }]);
+
+    } catch (error: any) {
       setStatus('error');
-      setErrorMessage('There seems to be an OpenAI configuration or model setup issue. Please check your settings and try again.');
+      let showEndpointsError = false;
+      let showConfigError = false;
+      if (error && typeof error.message === 'string') {
+        if (error.message.includes('no valid endpoints')) {
+          showEndpointsError = true;
+        } else {
+          const match = error.message.match(/\b[45]\d\d\b/);
+          if (match) {
+            showConfigError = true;
+          } else if (error.response && typeof error.response.status === 'number' && error.response.status >= 400 && error.response.status < 600) {
+            showConfigError = true;
+          }
+        }
+      }
+      if (showEndpointsError) {
+        setErrorMessage('Cannot generate artifact: No API endpoints found or Endpoint Body needs more token then model configured.\n\nPlease upload a valid HAR or Postman Collection file containing at least one API endpoint or valid content length   to generate test artifacts.');
+      } else if (showConfigError) {
+        setErrorMessage('There seems to be an OpenAI configuration or model setup issue. Please check your settings and try again.');
+      } else {
+        setErrorMessage('There seems to be an OpenAI configuration or model setup issue. Please check your settings and try again.');
+      }
       setShowErrorModal(true);
     }
   };
@@ -289,8 +1667,6 @@ ${Array.from(new Set(
     story.testCases.flatMap(testCase => {
       const endpoint = testCase.apiDetails?.endpoint;
       if (!endpoint) return [];
-
-      // ✅ Return only the trimmed full endpoint — never split on comma
       return [endpoint.trim()];
     })
   )
@@ -305,18 +1681,21 @@ ${story.testCases.map(tc => `
 #### Test Case: ${tc.title}
 - ID: ${tc.id}
 - Description: ${tc.description}
+- Prerequisites:
+  - Valid API endpoints
+  - Required authentication
+  - Test data available
 - Steps:
-${tc.steps.map((step, i) => `  ${i + 1}. ${step}`).join('\n')}
+${tc.steps.map((s, i) => `  ${i + 1}. ${s}`).join('\n')}
 - Expected Result: ${tc.expectedResult}
 - API Details:
-  - Method: ${tc.apiDetails.method}
-  - Endpoint: ${tc.apiDetails.endpoint}
-  - Headers: ${JSON.stringify(tc.apiDetails.headers || {}, null, 2)}
-  - Body: ${tc.apiDetails.body || 'N/A'}
-  - Expected Status: ${tc.apiDetails.expectedStatus}
+  - Method: ${tc.apiDetails?.method}
+  - Endpoint: ${tc.apiDetails?.endpoint}
+  - Headers: ${JSON.stringify(tc.apiDetails?.headers || {}, null, 2)}
+  - Body: ${tc.apiDetails?.body || 'N/A'}
+  - Expected Status: ${tc.apiDetails?.expectedStatus}
 - Severity: ${tc.severity}
 - Priority: ${tc.priority}
-- ReqId: ${tc.reqId}
 `).join('\n')}
 `).join('\n')}
 
@@ -451,13 +1830,20 @@ ${testPlan.negativeScenarios?.map(s => `- ${s}`).join('\n') || 'None'}
         return testPlan.stories.map(story => `
 # Test Scenario: ${story.title}
 
+## Story ID
+${story.id ?? '—'}
+
 ## Overview
-${story.description}
+${story.description ?? ''}
 
 ## Scenarios
 ${story.testCases.map(tc => `
 ### ${tc.title}
-${tc.description}
+- ID: ${tc.id ?? '—'}
+- Story ID: ${story.id ?? '—'}
+- Description: ${tc.description ?? ''}
+- Severity: ${tc.severity ?? 'N/A'}
+- Priority: ${tc.priority ?? 'N/A'}
 
 #### Prerequisites
 - Valid API endpoints
@@ -465,15 +1851,15 @@ ${tc.description}
 - Test data available
 
 #### Steps
-${tc.steps.join('\n')}
+${(tc.steps || []).join('\n')}
 
 #### Expected Outcome
-${tc.expectedResult}
+${tc.expectedResult ?? ''}
 
 #### API Details
-- Method: ${tc.apiDetails.method}
-- Endpoint: ${tc.apiDetails.endpoint}
-- Expected Status: ${tc.apiDetails.expectedStatus}
+- Method: ${tc.apiDetails?.method ?? ''}
+- Endpoint: ${tc.apiDetails?.endpoint ?? ''}
+- Expected Status: ${tc.apiDetails?.expectedStatus ?? ''}
 
 #### Validation Criteria
 - Response status matches expected status
@@ -486,34 +1872,38 @@ ${tc.expectedResult}
         return testPlan.stories.map(story => story.testCases.map(tc => `
 # Test Case: ${tc.title}
 
-## ID: ${tc.id}
-## Description: ${tc.description}
+- Story: ${story.title}
+- ID: ${tc.id ?? '—'}
+- Severity: ${tc.severity ?? 'N/A'}
+- Priority: ${tc.priority ?? 'N/A'}
+
+## Description
+${tc.description ?? ''}
 
 ### Prerequisites
-- API endpoint: ${tc.apiDetails.endpoint}
-- Method: ${tc.apiDetails.method}
+- API endpoint: ${tc.apiDetails?.endpoint ?? ''}
+- Method: ${tc.apiDetails?.method ?? ''}
 - Authentication: Required
 
 ### Steps
-${tc.steps.map((step, i) => `${i + 1}. ${step}`).join('\n')}
+${(tc.steps || []).map((step, i) => `${i + 1}. ${step}`).join('\n')}
 
 ### Expected Result
-${tc.expectedResult}
+${tc.expectedResult ?? ''}
 
 ### API Details
-- Method: ${tc.apiDetails.method}
-- Endpoint: ${tc.apiDetails.endpoint}
-- Headers: ${JSON.stringify(tc.apiDetails.headers || {}, null, 2)}
-- Body: ${tc.apiDetails.body || 'N/A'}
-- Expected Status: ${tc.apiDetails.expectedStatus}
+- Method: ${tc.apiDetails?.method ?? ''}
+- Endpoint: ${tc.apiDetails?.endpoint ?? ''}
+- Headers: ${JSON.stringify(tc.apiDetails?.headers || {}, null, 2)}
+- Body: ${tc.apiDetails?.body ?? 'N/A'}
+- Expected Status: ${tc.apiDetails?.expectedStatus ?? ''}
 
 ### Validation Points
-- Status code should be ${tc.apiDetails.expectedStatus}
+- Status code should be ${tc.apiDetails?.expectedStatus ?? ''}
 - Response format should match API specification
 - Error handling should be implemented
 - Data integrity should be maintained
 `).join('\n\n---\n\n')).join('\n\n');
-
       case 'code':
         return generatePlaywrightTests(testPlan);
 
@@ -560,7 +1950,7 @@ ${tc.expectedResult}
   }
 
   const extractApiEndpoints = (harEntries: any[]) => {
-    return harEntries
+    return (harEntries || [])
       .filter((entry: any) => entry.request && entry.request.url && entry.request.method)
       .map((entry: any) => ({
         method: entry.request.method,
@@ -569,13 +1959,70 @@ ${tc.expectedResult}
       }));
   };
 
-  const formatPayload = (payload: string) => {
-    try {
-      const parsedPayload = JSON.parse(payload);
-      return JSON.stringify(parsedPayload, null, 2);
-    } catch (e) {
-      return payload;
-    }
+  // Small reusable cell preview: truncated inline, click to open full modal with copy
+  const CellPreview: React.FC<{
+    text?: string | null;
+    label?: string;
+    monospace?: boolean;
+    maxChars?: number;
+  }> = ({ text = '', label, monospace = false, maxChars = 300 }) => {
+    const [open, setOpen] = useState(false);
+    const safeText = text ?? '';
+    const truncated = safeText.length > (maxChars ?? 300) ? safeText.slice(0, maxChars ?? 300) + '...' : safeText;
+
+    const copyToClipboard = async () => {
+      try {
+        await navigator.clipboard.writeText(safeText);
+      } catch (e) {
+        // ignore copy failures
+      }
+    };
+
+    return (
+      <div>
+        {label && <div className="text-xs text-gray-500 mb-1">{label}</div>}
+        <div className={`text-sm ${monospace ? 'font-mono text-xs' : ''} break-words`}>
+          <button
+            title={safeText}
+            onClick={() => setOpen(true)}
+            className="text-left w-full hover:underline"
+          >
+            {truncated}
+          </button>
+        </div>
+        {open && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center">
+            <div className="fixed inset-0 bg-black bg-opacity-40" onClick={() => setOpen(false)} />
+            <div className="relative bg-white rounded-lg shadow-lg w-11/12 max-w-3xl p-4">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold">{label ?? 'Full value'}</h3>
+                  <p className="text-xs text-gray-500">Click outside or press Close to dismiss</p>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                   
+                    className="text-xs px-2 py-1 bg-white border rounded hover:bg-gray-50"
+                    onClick={copyToClipboard}
+                  >
+                    Copy
+                  </button>
+                  <button
+                    className="text-xs px-2 py-1 bg-indigo-600 text-white rounded"
+                    onClick={() => setOpen(false)}
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 max-h-[60vh] overflow-auto">
+                <pre className={`whitespace-pre-wrap ${monospace ? 'font-mono text-xs' : 'text-sm'}`}>{safeText}</pre>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   const generationOptions = [
@@ -620,6 +2067,7 @@ ${tc.expectedResult}
         <p className="text-base text-gray-600 leading-relaxed mt-2">
           Turn your HAR or Postman files into <strong>Production-grade Test Plans, <br></br>Test Scenarios, Test Cases, and Playwright code </strong>instantly.  <br />
           Let AI do the heavy lifting for your QA workflows.
+              
         </p>
 
         <p className="text-sm text-gray-700">
@@ -641,8 +2089,8 @@ ${tc.expectedResult}
       </div>
     </div>
   </div>
-) :  (
-        <div className="w-2/3 max-w-3xl bg-white shadow-lg rounded-lg p-4 mt-8" style={{ backgroundColor: 'rgb(244 246 248)' }}>
+) : (
+  <div className="w-2/3 max-w-3xl bg-white shadow-lg rounded-lg p-4 mt-8" style={{ backgroundColor: 'rgb(244 246 248)' }}>
         <div className="text-center">
           <FileCode className="mx-auto h-12 w-12 text-indigo-600" />
           <h1 className="mt-6 text-4xl font-extrabold text-blue-500">CodePulse AI</h1>
@@ -872,12 +2320,37 @@ ${tc.expectedResult}
         {file && status !== 'processing' && (
           <button
             onClick={async () => {
-              if (file) {
+              try {
+                if (!file) return;
                 const fileContent = await file.text();
+                // If file is empty, still open the drawer and show 'No API endpoints found.'
+
+                if (!fileContent || fileContent.trim().length === 0) {
+                  setApiEndpoints([]);
+                  setShowApiDrawer(false);
+                  setErrorMessage('🚫 No API endpoints found in the uploaded file.\n\nPlease upload a valid HAR or Postman Collection file containing at least one API endpoint.');
+                  setShowErrorModal(true);
+                  return;
+                }
+
                 const harEntries = parseHarFile(fileContent);
                 const apiDetails = extractApiEndpoints(harEntries);
+                // Ensure we always show the API drawer even if apiDetails is empty
+                if (!apiDetails || apiDetails.length === 0) {
+                  setApiEndpoints([]);
+                  setShowApiDrawer(false);
+                  setErrorMessage('🚫 No API endpoints found in the uploaded file.\n\nPlease upload a valid HAR or Postman Collection file containing at least one API endpoint.');
+                  setShowErrorModal(true);
+                  return;
+                }
                 setApiEndpoints(apiDetails);
                 setShowApiDrawer(true);
+              } catch (err) {
+                // Consistent error modal for API list
+                setApiEndpoints([]);
+                setShowApiDrawer(false);
+                setErrorMessage('🚫 No API endpoints found in the uploaded file.\n\nPlease upload a valid HAR or Postman Collection file containing at least one API endpoint.');
+                setShowErrorModal(true);
               }
             }}
             className="w-full max-w-2xl mx-auto block px-4 py-2 mt-4 border border-transparent text-sm font-medium rounded-md text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500"
@@ -887,7 +2360,7 @@ ${tc.expectedResult}
         )}
 
         {/* Centered Popup Modal for API List */}
-        {showApiDrawer && (
+        {showApiDrawer && apiEndpoints.length > 0 && (
           <div className="fixed inset-0 z-50 flex items-center justify-center">
             {/* Overlay */}
             <div className="fixed inset-0 bg-black bg-opacity-30" onClick={() => setShowApiDrawer(false)} />
@@ -902,38 +2375,55 @@ ${tc.expectedResult}
               </button>
               <div className="p-6 overflow-y-auto max-h-[80vh]">
                 <h3 className="text-xl font-semibold mb-4 text-gray-800">API Endpoints</h3>
-                {apiEndpoints.length === 0 ? (
-                  <div className="text-gray-500">No API endpoints found.</div>
-                ) : (
-                  <div className="space-y-4">
-                    {apiEndpoints.map((api, index) => (
-                      <div key={index} className={`p-4 rounded-md shadow-md ${getMethodColor(api.method)}`}> 
-                        <div className="font-medium">API Endpoint {index + 1}</div>
-                        <p className="text-sm">Method: {api.method}</p>
-                        <p className="text-sm break-words whitespace-pre-wrap">URL: {api.url}</p>
-                        {api.payload && (
-                          <div className="mt-2">
-                            <p className="text-sm">Payload:</p>
-                            <pre className="bg-gray-200 p-2 rounded text-xs break-words whitespace-pre-wrap">{api.payload}</pre>
+                <div className="space-y-4">
+                  {apiEndpoints.map((api, index) => (
+                    <div key={index} className={`p-4 rounded-md shadow-md ${getMethodColor(api.method)}`}>
+                      <div className="flex items-start justify-between">
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium">API Endpoint {index + 1}</div>
+                          <p className="text-sm">Method: {api.method}</p>
+                          <div className="mt-1">
+                            <CellPreview text={api.url} label="URL" />
                           </div>
-                        )}
+                        </div>
+                        <div className="ml-4 flex-shrink-0">
+                          <button
+                            type="button"
+                            className="text-xs px-2 py-1 bg-white border rounded hover:bg-gray-50"
+                            onClick={async () => {
+                              try { await navigator.clipboard.writeText(api.url); } catch (e) { /* ignore copy failures */ }
+                            }}
+                          >
+                            Copy URL
+                          </button>
+                        </div>
                       </div>
-                    ))}
-                  </div>
-                )}
+                      {api.payload && (
+                        <div className="mt-2">
+                          <div className="text-sm text-gray-700 mb-1">Payload:</div>
+                          <CellPreview text={api.payload} label="Payload" monospace />
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
         )}
+        <Chatbot />
       </div>
-      )}
-      <Chatbot />
-
-    </div>
+    )}
+  </div>
   );
 }
 
+// If you have a Chatbot component, ensure it is imported and defined as a valid React component, e.g.:
+// import Chatbot from './components/Chatbot';
+
 // Chatbot with API key (place this at the end of App.tsx)
+// Ensure fetchConfig is imported or defined for Chatbot
+import { fetchConfig } from './services/configService';
 const Chatbot = () => {
   const [messages, setMessages] = useState<{ role: string; content: string }[]>([]);
   const [input, setInput] = useState("");
@@ -979,6 +2469,8 @@ const Chatbot = () => {
   "usability testing",
   "compatibility testing",
   "exploratory testing",
+  "test",
+
 
   // API Testing Specific
   "api testing",
@@ -1044,6 +2536,7 @@ const Chatbot = () => {
 
   const isTestingQuestion = (message: string): boolean => {
     const lowerMsg = message
+      .toLowerCase()
       .toLowerCase()
       .replace(/[^\w\s]/gi, ""); // remove punctuation
   
@@ -1126,18 +2619,18 @@ let reply: { role: string; content: string } | null = null;
    
     // Ensure the endpoint is defined
     if (!endpoint) {
-      console.error("Endpoint is not defined!");
+      // endpoint is undefined — inform user below without logging
       setMessages([
         ...newMessages,
         { role: "assistant", content: "AI connection failed. Please check your OpenAI configuration.  " },
       ]);
       setLoading(false);
       return;
-    }
+ }
    
 
     try {
-      const response = await fetch(endpoint, {
+      await fetch(endpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1165,11 +2658,11 @@ if (config.VITE_AZURE_OPENAI_MODEL === 'gpt-4o') {
         temperature: 0.7,
       }),
     });
- const data = await response.json();
-       reply = data.choices?.[0]?.message;
+    const data = await response.json();
+    reply = data.choices?.[0]?.message;
     // handle response here
   } catch (error) {
-    console.error("GPT-4o error:", error);
+    // ignore GPT-4o internal error here; user will receive a generic failure message if needed
   }
 }
 else {
@@ -1184,14 +2677,13 @@ else {
         messages: newMessages,
         model: 'o3-mini',
         reasoning_effort: "low",
-        // temperature: 0.7, // Uncomment if supported
       }),
     });
- const data = await response.json();
-       reply = data.choices?.[0]?.message;
+    const data = await response.json();
+    reply = data.choices?.[0]?.message;
     // handle response here
   } catch (error) {
-    console.error("o3-mini error:", error);
+    // ignore o3-mini internal error here; user will receive a generic failure message if needed
   }
 }
 
@@ -1204,7 +2696,7 @@ if (reply) {
         ]);
       }
     } catch (err) {
-      console.error("Chatbot error:", err);
+      // Chatbot network or runtime error — show user-friendly message but avoid console logging
       setMessages([
         ...newMessages,
         { role: "assistant", content: "AI connection failed. Please check your OpenAI configuration." },
@@ -1238,7 +2730,6 @@ if (reply) {
       return;
     }
     if (!endpoint) {
-      console.error("Endpoint is not defined!");
       setMessages([
         ...newMessages,
         { role: "assistant", content: "AI connection failed. Please check your OpenAI configuration.  " },
@@ -1269,7 +2760,7 @@ if (reply) {
         ]);
       }
     } catch (err) {
-      console.error("Chatbot error:", err);
+      // Chatbot network or runtime error — show user-friendly message but avoid console logging
       setMessages([
         ...newMessages,
         { role: "assistant", content: "AI connection failed. Please check your OpenAI configuration." },
@@ -1296,6 +2787,7 @@ if (reply) {
       <h3 className="text-lg font-semibold mb-2 flex justify-between items-center">
         🤖 CodePulse Chatbot
         <button
+         
           className="text-sm text-gray-500 hover:text-gray-700"
           onClick={() => setIsMinimized(!isMinimized)}
         >
@@ -1361,7 +2853,5 @@ if (reply) {
       )}
     </div>
   );
-  
-};
-
+}
 export default App;
